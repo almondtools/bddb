@@ -1,0 +1,16 @@
+[package]
+name = "bddb"
+version = "0.1.0"
+authors = ["Stefan Mandel <mandelst@gmail.com>"]
+edition = "2024"
+
+[dependencies]
+logos = "0.11.4"
+lalrpop-util = {version = "0.22.0", features = ["lexer"]}
+regex = "1"
+smallbitvec = "2.5.3"
+
+[dev-dependencies]
+
+[build-dependencies]
+lalrpop = {version = "0.22.0", features = ["lexer"]}
