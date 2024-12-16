@@ -4,11 +4,16 @@ version = "0.1.0"
 authors = ["Stefan Mandel <mandelst@gmail.com>"]
 edition = "2024"
 
+[toolchain]
+channel = "nightly"
+
 [dependencies]
 logos = "0.11.4"
 lalrpop-util = {version = "0.22.0", features = ["lexer"]}
 regex = "1"
-smallbitvec = "2.5.3"
+oxidd = {version = "0.10.0", features = ["bdd"]}
+oxidd-core = "0.10.0"
+oxidd-dump = "0.5.0"
 
 [dev-dependencies]
 

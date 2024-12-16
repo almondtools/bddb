@@ -1,0 +1,109 @@
+use crate::lang::ast::*;
+use crate::lang::source::*;
+use crate::lang::datalog_lalr::*;
+use std::rc::Rc;
+
+grammar;
+
+
+match {
+  ",",";",
+  "(",")",
+  "[","]",
+  "<","<=",">",">=","!=","=",
+  "<-","->",
+  "~","&","|","*",
+  r"true|false" => BOOLEAN,
+  r"-?[0-9]+"=> INTEGER,
+  r#""([^"\\]|\\t|\\u|\\n|\\"|\\\\)*""# => STRING,
+} else {
+  r"[a-zA-Z_$][a-zA-Z0-9_$]*" => ID,
+}
+
+Operator:Operator = {
+  "<" => Operator::Less,
+  "<=" => Operator::LessEqual,
+  ">" => Operator::Greater,
+  ">=" => Operator::GreaterEqual,
+  "!=" => Operator::NotEqual,
+  "=" => Operator::Equal,
+}
+
+pub Term: Term = {
+  <val:OrdVal> => Term::OrdVal(val),
+  <val:BoolVal> => Term::BoolVal(val),
+  <val:StringVal> => Term::StringVal(val),
+  <var:Identifier> => Term::Variable(var),
+  "*" => Term::Any
+}
+
+Terms = CommaSeparated<Term>;
+
+pub PrefixLiteral:PrefixLiteral = {
+  <name:Identifier> "(" <terms:Terms> ")" => PrefixLiteral::new(name,terms),
+}
+
+pub InfixLiteral:InfixLiteral = {
+  <l_term:Term> <op:Operator> <r_term:Term> => InfixLiteral::new(l_term, op, r_term),
+}
+
+pub Literal: Literal = {
+  "~" <literal:PrefixLiteral> => Literal::Negative(literal),
+  <literal:PrefixLiteral> => Literal::Positive(literal),
+  <literal:InfixLiteral> => Literal::Comparative(literal),
+}
+
+pub Body = AndSeparated<Literal>;
+
+pub Rule:Rule = {
+  <f:@L><head:PrefixLiteral> "<-" <body:Body> ";" <t:@L> =>? create_rule(head, body, f, t),
+}
+
+Attributes = CommaSeparated<Identifier>;
+
+pub Relation:Relation = {
+  <name:Identifier> "[" <attributes:Attributes> "]" ";" => relation(name, attributes),
+  <name:Identifier> "[" <attributes:Attributes> "]" "<-" <s:StringVal> ";" => relation(name,attributes).loaded_from(s),
+  <name:Identifier> "[" <attributes:Attributes> "]" "->" <s:StringVal> ";" => relation(name,attributes).stored_to(s)
+}
+
+pub Domain:Domain = {
+  <name:Identifier> "~" <size:OrdVal> "<-" <source:StringVal> ";" => domain(name, size).loaded_from(source)
+}
+
+pub Spec:Spec = {
+  <domains:Domain*>
+  <relations:Relation*> 
+  <rules:Rule*> => Spec::new(domains,relations,rules)
+}
+
+
+CommaSeparated<T>: Vec<T> = {
+    <e:T?> => {
+      e.into_iter().collect::<Vec<_>>()
+    },
+    <v:(<T> ",")+> <e:T> => {
+      let mut v = v;
+      v.push(e);
+      v
+    }
+};
+
+AndSeparated<T>: Vec<T> = {
+    <v:(<T> "&")*> <e:T> => {
+      let mut v = v;
+      v.push(e);
+      v
+    }
+};
+
+BoolVal:bool = <s:BOOLEAN> => recognize_bool(<>);
+OrdVal:u128 = <l:@L><s:INTEGER> =>? recognize_ord(s, l);
+StringVal:Rc<str> = <s:STRING> => recognize_string(s);
+Identifier:Rc<str> = <s:ID> => recognize_identifier(s);
+
+extern {
+  type Error = AnalysisError<BytePos>;
+}
+
+
