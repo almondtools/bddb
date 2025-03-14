@@ -5,19 +5,43 @@ use oxidd::bdd::{BDDFunction, BDDManagerRef};
 use oxidd::util::{AllocResult, OutOfMemory};
 use oxidd::{BooleanFunction, ManagerRef};
 
-use crate::lang::graph::{BIRGenerator, BIRProg, BIRVisitor, Location, RuleGraph, Variable};
+use crate::lang::datalog_lalr::SemanticError;
+use crate::lang::graph::{Cmp, RuleGraph, Value};
+use crate::lang::ir::{BIRGenerator, BIRInst, BIRProg, BIRVisitor, Location, TypeAnalyzer, Variable};
 
 use super::database::BDDBManager;
-use super::domain::DomainSource;
+use super::domain::{BDDDomain, DomainSource};
 use super::relation::{BDDRelation, RelationIn, RelationOut, TupleSource, TupleStore};
 
 #[derive(Debug)]
 pub enum ExecutionError {
-  Unexpected(&'static str),
-  Memory(&'static str),
+  Unexpected(String),
+  Memory(String),
 }
 
 pub type ExecutionResult = Result<(), ExecutionError>;
+
+impl From<OutOfMemory> for ExecutionError {
+  fn from(_: OutOfMemory) -> Self {
+    ExecutionError::Memory("out of memory".into())
+  }
+}
+
+impl From<SemanticError> for ExecutionError {
+  fn from(e: SemanticError) -> Self {
+    match e {
+      SemanticError::UnknownDomain(msg) => ExecutionError::Unexpected(format!("Unknown domain at runtime: {}", msg)),
+      SemanticError::UnknownRelation(msg) => ExecutionError::Unexpected(format!("Unknown relation at runtime {}", msg)),
+      SemanticError::MissingType(msg) => ExecutionError::Unexpected(format!("Missing type at runtime {}", msg)),
+    }
+  }
+}
+
+impl From<()> for ExecutionError {
+  fn from(_: ()) -> Self {
+    ExecutionError::Unexpected("Unexpected error".into())
+  }
+}
 
 #[derive(Default)]
 pub struct Evaluator {
@@ -51,16 +75,18 @@ impl Evaluator {
   }
 
   pub fn execute(&self, graph: RuleGraph, manager: BDDBManager) -> ExecutionResult {
-    let ir = self.create_bdd_ir(&graph, manager.manager().clone());
-    ir.accept(&mut BIRPrinter::new()).map_err(|_| ExecutionError::Unexpected("printing BIR"))?;
-    ir.accept(&mut BIRInterpreter::new(self, manager)).map_err(|_| ExecutionError::Memory("out of memory"))?;
+    let ir = self.create_bdd_ir(&graph, manager.manager().clone())?;
+    ir.accept(&mut BIRPrinter::new())?;
+    ir.accept(&mut BIRInterpreter::new(self, manager))?;
     Ok(())
   }
 
-  pub fn create_bdd_ir(&self, graph: &RuleGraph, manager: BDDManagerRef) -> BIRProg {
-    let mut ir_generator = BIRGenerator::new(manager);
-    graph.accept(&mut ir_generator);
-    ir_generator.ir()
+  pub fn create_bdd_ir(&self, graph: &RuleGraph, manager: BDDManagerRef) -> Result<BIRProg, ExecutionError> {
+    let mut ir_types = TypeAnalyzer::new();
+    graph.accept(&mut ir_types)?;
+    let mut ir_generator = BIRGenerator::new(manager, ir_types.types());
+    graph.accept(&mut ir_generator)?;
+    Ok(ir_generator.ir())
   }
 }
 
@@ -78,6 +104,33 @@ impl<'a> BIRInterpreter<'a> {
 }
 
 impl BIRVisitor<OutOfMemory> for BIRInterpreter<'_> {
+  fn iter(&mut self, current: &Variable, next: &Variable, body: &Vec<BIRInst>) -> AllocResult<()> {
+    let mut body = body.clone();
+    loop {
+      for inst in body.iter_mut() {
+        inst.accept(self)?;
+      }
+      let current_bdd = self.variables.get(&current.name).expect("compile error");
+      let next_bdd = self.variables.get(&next.name).expect("compile error");
+      if current_bdd == next_bdd {
+        break;
+      }
+    }
+
+    Ok(())
+  }
+
+  fn empty(&mut self, to: &Variable) -> AllocResult<()> {
+    let name = to.name.clone();
+
+    let domains = to.domains().to_vec();
+
+    let relation = self.manager.relation(name.clone(), domains).init_empty()?;
+
+    self.variables.insert(name, relation);
+    Ok(())
+  }
+
   fn load(&mut self, to: &Variable, from: &Location) -> AllocResult<()> {
     let name = to.name.clone();
 
@@ -98,6 +151,7 @@ impl BIRVisitor<OutOfMemory> for BIRInterpreter<'_> {
       }
       Ok(bdd)
     })?;
+
     self.variables.insert(name, relation);
     Ok(())
   }
@@ -130,6 +184,50 @@ impl BIRVisitor<OutOfMemory> for BIRInterpreter<'_> {
     Ok(())
   }
 
+  fn select(&mut self, to: &Variable, from: &Variable, by: &Vec<(Arc<BDDDomain>, Cmp, Value)>) -> AllocResult<()> {
+    let relation = self.variables.get(&from.name).expect("compile error");
+
+    let domains = by.iter().map(|(d, _, _)| d.clone()).fold(Vec::new(), |mut domains, domain| {
+      if !domains.contains(&domain) {
+        domains.push(domain);
+      }
+      domains
+    });
+
+    let bounds = self.manager.relation(Arc::from("bounds"), domains).from_src(|domains| {
+      let mut bdd = domains.iter().map(|d| Ok(d.domain()?)).reduce(|bdd1, bdd2| bdd1?.and(&bdd2?)).unwrap()?;
+
+      for (d, cmp, val) in by.iter() {
+        let source = self.evaluator.domains.get(&d.name).expect("compile error");
+        let value = match val {
+          Value::Str(s) => source.value(s),
+          Value::Ord(o) => *o,
+          Value::Bool(b) => {
+            if *b {
+              1
+            } else {
+              0
+            }
+          }
+        };
+        bdd = match cmp {
+          Cmp::EQ => bdd.and(&d.value(value)?)?,
+          Cmp::NE => bdd.and(&d.value_ne(value)?)?,
+          Cmp::LT => bdd.and(&d.value_lt(value)?)?,
+          Cmp::LE => bdd.and(&d.value_le(value)?)?,
+          Cmp::GT => bdd.and(&d.value_gt(value)?)?,
+          Cmp::GE => bdd.and(&d.value_ge(value)?)?,
+        };
+      }
+      Ok(bdd)
+    })?;
+
+    let selected = relation.join(&bounds)?.into(to.name.clone()).project(to.domains())?.into(to.name.clone());
+
+    self.variables.insert(to.name.clone(), selected);
+    Ok(())
+  }
+
   fn join(&mut self, to: &Variable, left: &Variable, right: &Variable) -> AllocResult<()> {
     let left = self.variables.get(&left.name).expect("compile error");
     let right = self.variables.get(&right.name).expect("compile error");
@@ -158,35 +256,65 @@ impl BIRPrinter {
 }
 
 impl BIRVisitor<()> for BIRPrinter {
+  fn iter(&mut self, current: &Variable, next: &Variable, body: &Vec<BIRInst>) -> Result<(), ()> {
+    println!("DO {{");
+    for inst in body {
+      inst.accept(self)?;
+    }
+    println!("}} UNTIL {} [{}] = {} [{}]", &current.name, domains(current), &next.name, domains(next));
+    Ok(())
+  }
+
+  fn empty(&mut self, to: &Variable) -> Result<(), ()> {
+    println!("EMPTY {} [{}]", &to.name, domains(to));
+    Ok(())
+  }
+
   fn load(&mut self, to: &Variable, from: &Location) -> Result<(), ()> {
-    println!("LOAD {} <- {}", &to.name, &from.uri);
+    println!("LOAD {} [{}] <- {} ", &to.name, domains(to), &from.uri);
     Ok(())
   }
 
   fn store(&mut self, from: &Variable, to: &Location) -> Result<(), ()> {
-    println!("STORE {} -> {}", &from.name, &to.uri);
+    println!("STORE {} [{}] -> {}", &from.name, domains(from), &to.uri);
     Ok(())
   }
 
   fn copy(&mut self, to: &Variable, from: &Variable) -> Result<(), ()> {
-    println!("COPY {} <- {}", &to.name, &from.name);
+    println!("COPY {} [{}] <- {} [{}]", &to.name, domains(to), &from.name, domains(from));
     Ok(())
   }
 
   fn project(&mut self, to: &Variable, from: &Variable) -> Result<(), ()> {
-    println!("PROJECT {} <- {}", &to.name, &from.name);
+    println!("PROJECT {}  [{}] <- π {}  [{}]", &to.name, domains(to), &from.name, domains(from));
+    Ok(())
+  }
+
+  fn select(&mut self, to: &Variable, from: &Variable, by: &Vec<(Arc<BDDDomain>, Cmp, Value)>) -> Result<(), ()> {
+    println!(
+      "SELECT {}  [{}] <- σ {}  [{}] | {}",
+      &to.name,
+      domains(to),
+      &from.name,
+      domains(from),
+      by.iter().map(|(d, c, v)| format!("{}_{} {} {}", d.name, d.id, c, v)).collect::<Vec<_>>().join(" & ")
+    );
     Ok(())
   }
 
   fn join(&mut self, to: &Variable, left: &Variable, right: &Variable) -> Result<(), ()> {
-    println!("JOIN {} <- {} & {}", &to.name, &left.name, &right.name);
+    println!("JOIN {}  [{}] <- {} [{}] & {} [{}]", &to.name, domains(to), &left.name, domains(left), &right.name, domains(right));
     Ok(())
   }
 
   fn union(&mut self, to: &Variable, left: &Variable, right: &Variable) -> Result<(), ()> {
-    println!("UNION {} <- {} | {}", &to.name, &left.name, &right.name);
+    println!("UNION {} [{}] <- {} [{}] | {} [{}]", &to.name, domains(to), &left.name, domains(left), &right.name, domains(right));
     Ok(())
   }
+}
+
+fn domains(variable: &Variable) -> String {
+  variable.domains().iter().map(|d| format!("{}_{}", &d.name, d.id)).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -195,7 +323,9 @@ mod test {
 
   use std::sync::Mutex;
 
-  use crate::relation;
+  use crate::testutil::core::{Locatable, expect};
+  use crate::testutil::matchers::equal_to::EqualTo;
+  use crate::{expect, relation};
 
   use super::*;
 
@@ -211,17 +341,17 @@ mod test {
 
       let manager = BDDBManager::new(1024, 1024, 1);
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let mut base_domain = interpreter.manager.domain(2).loaded_from(name("dom"));
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1, dom2]);
+      let mut base_domain = interpreter.manager.domain(name("dom"), 2).loaded_from(name("dom"));
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1, dom2]);
       let inp = Location::from("rel");
       interpreter.load(&var, &inp).unwrap();
 
       let rel = interpreter.variables.get(&name("rel")).unwrap();
 
       let sat = rel.sat_count(interpreter.manager.cache_count()).solutions().unwrap();
-      assert_eq!(sat, 1);
+      expect!(sat).to_equal(1);
     }
 
     #[test]
@@ -232,17 +362,17 @@ mod test {
 
       let manager = BDDBManager::new(1024, 1024, 1);
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let mut base_domain = interpreter.manager.domain(2).loaded_from(name("dom"));
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1, dom2]);
+      let mut base_domain = interpreter.manager.domain(name("dom"), 2).loaded_from(name("dom"));
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1, dom2]);
       let inp = Location::from("rel");
       interpreter.load(&var, &inp).unwrap();
 
       let rel = interpreter.variables.get(&name("rel")).unwrap();
 
       let sat = rel.sat_count(interpreter.manager.cache_count()).solutions().unwrap();
-      assert_eq!(sat, 2);
+      expect!(sat).to_equal(2);
     }
 
     #[test]
@@ -253,17 +383,17 @@ mod test {
 
       let manager = BDDBManager::new(1024, 1024, 1);
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let mut base_domain = interpreter.manager.domain(4).loaded_from(name("dom"));
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1, dom2]);
+      let mut base_domain = interpreter.manager.domain(name("dom"), 4).loaded_from(name("dom"));
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1, dom2]);
       let inp = Location::from("rel");
       interpreter.load(&var, &inp).unwrap();
 
       let rel = interpreter.variables.get(&name("rel")).unwrap();
 
       let sat = rel.sat_count(interpreter.manager.cache_count()).solutions().unwrap();
-      assert_eq!(sat, 3);
+      expect!(sat).to_equal(3);
     }
 
     #[test]
@@ -274,18 +404,18 @@ mod test {
 
       let manager = BDDBManager::new(1024, 1024, 1);
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let mut base_domain = interpreter.manager.domain(4).loaded_from(name("dom"));
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let _dom2 = base_domain.instance(name("dom2")).unwrap();
-      let dom3 = base_domain.instance(name("dom3")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom3, dom1]);
+      let mut base_domain = interpreter.manager.domain(name("dom"), 4).loaded_from(name("dom"));
+      let dom1 = base_domain.instance(1).unwrap();
+      let _dom2 = base_domain.instance(2).unwrap();
+      let dom3 = base_domain.instance(3).unwrap();
+      let var = Variable::new(name("rel"), vec![dom3, dom1]);
       let inp = Location::from("rel");
       interpreter.load(&var, &inp).unwrap();
 
       let rel = interpreter.variables.get(&name("rel")).unwrap();
 
       let sat = rel.sat_count(interpreter.manager.cache_count()).solutions().unwrap();
-      assert_eq!(sat, 3);
+      expect!(sat).to_equal(3);
     }
   }
 
@@ -307,10 +437,10 @@ mod test {
 
       let manager = BDDBManager::new(1024, 1024, 1);
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let mut base_domain = interpreter.manager.domain(2).loaded_from(name("dom"));
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1.clone(), dom2.clone()]);
+      let mut base_domain = interpreter.manager.domain(name("dom"), 2).loaded_from(name("dom"));
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1.clone(), dom2.clone()]);
       let out = Location::from("rel");
       let rel = interpreter
         .manager
@@ -338,10 +468,10 @@ mod test {
 
       let manager = BDDBManager::new(1024, 1024, 1);
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let mut base_domain = interpreter.manager.domain(2).loaded_from(name("dom"));
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1.clone(), dom2.clone()]);
+      let mut base_domain = interpreter.manager.domain(name("dom"), 2).loaded_from(name("dom"));
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1.clone(), dom2.clone()]);
       let out = Location::from("rel");
       let rel = interpreter
         .manager
@@ -368,11 +498,11 @@ mod test {
       evaluator.register_out("rel", &["dom", "dom"], TupleStore::Set(result.clone()));
 
       let manager = BDDBManager::new(1024, 1024, 1);
-      let mut base_domain = manager.domain(4).loaded_from(name("dom"));
+      let mut base_domain = manager.domain(name("dom"), 4).loaded_from(name("dom"));
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1.clone(), dom2.clone()]);
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1.clone(), dom2.clone()]);
       let out = Location::from("rel");
       let rel = interpreter
         .manager
@@ -404,12 +534,12 @@ mod test {
       evaluator.register_out("rel", &["dom", "dom"], TupleStore::Set(result.clone()));
 
       let manager = BDDBManager::new(1024, 1024, 1);
-      let mut base_domain = manager.domain(4).loaded_from(name("dom"));
+      let mut base_domain = manager.domain(name("dom"), 4).loaded_from(name("dom"));
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let _dom2 = base_domain.instance(name("dom2")).unwrap();
-      let dom3 = base_domain.instance(name("dom3")).unwrap();
-      let var = Variable::new(name("rel")).with_domains(vec![dom1.clone(), dom3.clone()]);
+      let dom1 = base_domain.instance(1).unwrap();
+      let _dom2 = base_domain.instance(2).unwrap();
+      let dom3 = base_domain.instance(3).unwrap();
+      let var = Variable::new(name("rel"), vec![dom1.clone(), dom3.clone()]);
       let out = Location::from("rel");
       let rel = interpreter
         .manager
@@ -451,13 +581,13 @@ mod test {
       evaluator.register_out("rel", &["dom", "dom"], TupleStore::Set(result.clone()));
 
       let manager = BDDBManager::new(1024, 1024, 1);
-      let mut base_domain = manager.domain(4).loaded_from(name("dom"));
+      let mut base_domain = manager.domain(name("dom"), 4).loaded_from(name("dom"));
       let mut interpreter = BIRInterpreter::new(&evaluator, manager);
-      let dom1 = base_domain.instance(name("dom1")).unwrap();
-      let dom2 = base_domain.instance(name("dom2")).unwrap();
-      let dom3 = base_domain.instance(name("dom3")).unwrap();
-      let var1 = Variable::new(name("rel_1")).with_domains(vec![dom1.clone(), dom2.clone()]);
-      let var2 = Variable::new(name("rel_2")).with_domains(vec![dom2.clone(), dom3.clone()]);
+      let dom1 = base_domain.instance(1).unwrap();
+      let dom2 = base_domain.instance(2).unwrap();
+      let dom3 = base_domain.instance(3).unwrap();
+      let var1 = Variable::new(name("rel_1"), vec![dom1.clone(), dom2.clone()]);
+      let var2 = Variable::new(name("rel_2"), vec![dom2.clone(), dom3.clone()]);
 
       let rel_1 = interpreter
         .manager
@@ -485,7 +615,7 @@ mod test {
       assert_eq!(rel_2.domains(), vec![dom2.clone(), dom3.clone()]);
 
       let sat = rel_1.sat_count(interpreter.manager.cache_count()).solutions().unwrap();
-      assert_eq!(sat, 2);
+      expect!(sat).to_equal(2);
     }
   }
 

@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use oxidd::bdd::{BDDFunction, BDDManagerRef};
 use oxidd::util::{AllocResult, SatCountCache};
-use oxidd::{BooleanFunction, BooleanFunctionQuant, Function, FunctionSubst, Manager, Subst};
+use oxidd::{BooleanFunction, BooleanFunctionQuant, Function, FunctionSubst, Manager, ManagerRef, Subst};
 
 use super::counter::ShiftCounter;
-use super::domain::{BDDDomain, BDDSelect, DomainSource};
+use super::domain::{BDDDomain, DomainSource};
 
 pub enum TupleSource {
   Set(BTreeSet<Vec<Arc<str>>>),
@@ -94,6 +94,12 @@ impl BDDRelationDef {
     let bdd = values(&domains)?;
     Ok(BDDRelation { name, manager, domains, bdd })
   }
+
+  pub fn init_empty(self) -> AllocResult<BDDRelation> {
+    let BDDRelationDef { name, manager, domains } = self;
+    let bdd = manager.with_manager_shared(|manager| BDDFunction::f(manager));
+    Ok(BDDRelation { name, manager, domains, bdd })
+  }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -149,28 +155,18 @@ impl BDDRelation {
     Ok(BDDRelation { name, manager, domains, bdd })
   }
 
-  pub fn select(&self, bindings: Vec<BDDSelect>) -> AllocResult<BDDUnnamedRelation> {
-    let manager = self.manager.clone();
-    let domains = self.domains.to_vec();
-    let mut bdd = self.bdd.clone();
-    for binding in bindings {
-      let select = match binding {
-        BDDSelect::One(var, val) => var.value(val)?,
-        BDDSelect::OneOf(var, vals) => var.values(vals)?,
-        BDDSelect::Multiple(vars, vals) => tuples(&vars, vals)?,
-      };
-      bdd = self.bdd.and(&select)?;
-    }
-    Ok(BDDUnnamedRelation { manager, domains, bdd })
-  }
-
   pub fn project(&self, vars: &[Arc<BDDDomain>]) -> AllocResult<BDDUnnamedRelation> {
     let manager = self.manager.clone();
     let domains = vars.to_vec();
     let mut bdd = self.bdd.clone();
 
-    for var in self.domains.iter().filter(|domain| !vars.contains(domain)).flat_map(|var| var.vars()) {
-      bdd = bdd.exists(var)?;
+    for domain in &self.domains {
+      if vars.contains(domain) {
+        continue;
+      }
+      for var in domain.vars() {
+        bdd = bdd.exists(var)?;
+      }
     }
     Ok(BDDUnnamedRelation { manager, domains, bdd })
   }
@@ -211,7 +207,10 @@ struct DomainDecisions {
 
 impl Debug for DomainDecisions {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("DomainDecisions").field("decisions", &self.decisions).finish()
+    f.debug_struct("DomainDecisions")
+      .field("domain", &format!("{} {:?}", &self.domain.name, &self.domain.range()))
+      .field("decisions", &self.decisions)
+      .finish()
   }
 }
 
@@ -249,6 +248,10 @@ impl DomainDecisions {
     next_level
   }
 
+  pub fn last_level(&self) -> u32 {
+    self.domain.range().1 - 1
+  }
+
   pub fn value(&self) -> u128 {
     self.decisions.iter().map(|decision| decision.assignment()).fold(0, |v, ass| v << 1 | if ass { 1 } else { 0 })
   }
@@ -272,6 +275,14 @@ impl DomainDecisions {
     if current_bdd.valid() {
       self.fill(|level| Decision::Wildcard(level, false));
       return Some(current_bdd);
+    } else if !current_bdd.satisfiable() {
+      return None;
+    }
+    let last_level = self.last_level();
+    let next_level = self.next_level();
+    let current_level = u32::min(current_bdd.level(), last_level);
+    for level in next_level..current_level {
+      self.insert(Decision::Wildcard(level, false));
     }
     while self.unassigned() {
       let Some((t_bdd, f_bdd)) = current_bdd.cofactors() else { return None };
@@ -385,7 +396,7 @@ pub struct SolutionIter<'a> {
   domain_stack: Vec<DomainDecisions>,
 }
 
-trait Variable {
+pub trait Variable {
   fn level(&self) -> u32;
 }
 
@@ -401,12 +412,18 @@ impl Variable for BDDFunction {
 impl<'a> SolutionIter<'a> {
   pub fn new<'b>(rel: &'b BDDRelation) -> SolutionIter<'b> {
     let started = false;
-    let domain_stack = rel.domains.iter().map(|domain| DomainDecisions::for_domain(domain.clone())).collect();
+    let mut domain_stack: Vec<DomainDecisions> = rel.domains.iter().map(|domain| DomainDecisions::for_domain(domain.clone())).collect();
+    domain_stack.sort_by(|DomainDecisions { domain: domain_1, .. }, DomainDecisions { domain: domain_2, .. }| domain_1.range().cmp(&domain_2.range()));
     SolutionIter { rel, started, domain_stack }
   }
 
   fn value(&self) -> Vec<u128> {
-    self.domain_stack.iter().map(|decisions| decisions.value()).collect()
+    self
+      .rel
+      .domains
+      .iter()
+      .flat_map(|domain| self.domain_stack.iter().find_map(|decisions| if &decisions.domain == domain { Some(decisions.value()) } else { None }))
+      .collect()
   }
 
   fn first_solution(&mut self) -> Option<Vec<u128>> {
@@ -532,33 +549,62 @@ impl<'a> Iterator for SolutionIter<'a> {
   }
 }
 
-fn tuples(vars: &[Arc<BDDDomain>], tuples: Vec<Vec<u128>>) -> AllocResult<BDDFunction> {
-  let mut result: Option<BDDFunction> = None;
-  for tuple in tuples {
-    let next = vars
-      .iter()
-      .zip(tuple.into_iter())
-      .map(|(var, val)| var.value(val))
-      .reduce(|bdd, next| bdd.and_then(|bdd| Ok(bdd.and(&next?)?)))
-      .unwrap()?;
-    if let Some(bdd) = result {
-      result = Some(bdd.or(&next)?);
-    } else {
-      result = Some(next);
-    }
-  }
-  Ok(result.unwrap())
-}
-
 #[cfg(test)]
 mod test {
 
   use super::*;
   use crate::bdd::database::BDDBManager;
   use crate::bdd::domain::DomainSource;
+  use crate::expect;
+  use crate::testutil::core::{Locatable, expect};
+  use crate::testutil::matchers::contains::Contains;
+  use crate::testutil::matchers::empty::Empty;
+  use crate::testutil::matchers::equal_to::EqualTo;
 
   mod bdd_relation {
     use super::*;
+
+    mod solutions {
+      use super::*;
+
+      #[test]
+      fn one_domain() {
+        let mut manager = BDDBManager::new(1024, 1024, 1);
+
+        let num_src = Arc::new(DomainSource::set_of(vec!["1", "2", "3", "4"]));
+        let mut num_dom = manager.domain(name("num_dom"), num_src.size());
+        let num_dom_1 = num_dom.instance(1).unwrap();
+
+        let exp = manager
+          .relation("exp", vec![num_dom_1.clone()])
+          .from_src(from(&[num_src.clone()]).tuple(&["1"]).tuple(&["3"]).factory())
+          .unwrap();
+
+        let sat = exp.sat_count(manager.cache_count()).solutions().unwrap();
+        expect!(sat).to_equal(2);
+        expect!(exp.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0], vec![2]]);
+      }
+
+      #[test]
+      fn two_domains() {
+        let mut manager = BDDBManager::new(1024, 1024, 1);
+
+        let char_src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
+        let mut char_dom = manager.domain(name("char_dom"), char_src.size());
+        let char_dom_1 = char_dom.instance(1).unwrap();
+        let num_src = Arc::new(DomainSource::set_of(vec!["1", "2", "3", "4"]));
+        let mut num_dom = manager.domain(name("num_dom"), num_src.size());
+        let num_dom_1 = num_dom.instance(1).unwrap();
+
+        let rel = manager
+          .relation("rel", vec![num_dom_1.clone(), char_dom_1.clone()])
+          .from_src(from(&[num_src.clone(), char_src.clone()]).tuple(&["1", "A"]).tuple(&["3", "B"]).factory())
+          .unwrap();
+        let sat = rel.sat_count(manager.cache_count()).solutions().unwrap();
+        expect!(sat).to_equal(2);
+        expect!(rel.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 0], vec![2, 1]]);
+      }
+    }
 
     mod join {
       use super::*;
@@ -570,10 +616,10 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone()])
@@ -586,7 +632,8 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 1);
+          expect!(sat).to_equal(1);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 2]]);
         }
 
         #[test]
@@ -594,10 +641,10 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone()])
@@ -610,7 +657,8 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 0);
+          expect!(sat).to_equal(0);
+          expect!(joint.solutions().next()).to_be_empty();
         }
 
         #[test]
@@ -618,10 +666,10 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone()])
@@ -634,7 +682,8 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 4);
+          expect!(sat).to_equal(4);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 2], vec![0, 1, 3], vec![3, 1, 2], vec![3, 1, 3]]);
         }
       }
 
@@ -646,11 +695,11 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2_1 = dom.instance(name("dom2_1")).unwrap();
-          let dom2_2 = dom.instance(name("dom2_2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2_1 = dom.instance(21).unwrap();
+          let dom2_2 = dom.instance(22).unwrap();
+          let dom3 = dom.instance(3).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2_1.clone()])
@@ -663,7 +712,8 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 2);
+          expect!(sat).to_equal(2);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 1, 2], vec![0, 1, 2, 3]]);
         }
 
         #[test]
@@ -671,11 +721,11 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2_1 = dom.instance(name("dom2")).unwrap();
-          let dom2_2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2_1 = dom.instance(2).unwrap();
+          let dom2_2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2_1.clone()])
@@ -690,7 +740,8 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 1);
+          expect!(sat).to_equal(1);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 2]]);
         }
       }
 
@@ -702,11 +753,11 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
-          let dom4 = dom.instance(name("dom4")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
+          let dom4 = dom.instance(4).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone(), dom3.clone()])
@@ -719,7 +770,8 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 1);
+          expect!(sat).to_equal(1);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 2, 3]]);
         }
 
         #[test]
@@ -727,11 +779,11 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
-          let dom4 = dom.instance(name("dom4")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
+          let dom4 = dom.instance(4).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone(), dom3.clone()])
@@ -744,19 +796,19 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 0);
+          expect!(sat).to_equal(0);
         }
 
         #[test]
-        fn more() {
+        fn more1() {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
-          let dom4 = dom.instance(name("dom4")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
+          let dom4 = dom.instance(4).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone(), dom3.clone()])
@@ -769,19 +821,20 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 2);
+          expect!(sat).to_equal(2);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 2, 2], vec![3, 1, 3, 3]]);
         }
 
         #[test]
-        fn even_more() {
+        fn more2() {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
-          let dom4 = dom.instance(name("dom4")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
+          let dom3 = dom.instance(3).unwrap();
+          let dom4 = dom.instance(4).unwrap();
 
           let left = manager
             .relation("left", vec![dom1.clone(), dom2.clone(), dom3.clone()])
@@ -801,163 +854,42 @@ mod test {
           let joint = left.join(&right).unwrap().into("joint");
 
           let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 4);
-        }
-      }
-    }
-
-    mod select {
-      use super::*;
-      mod on_single_attribute {
-        use super::*;
-
-        #[test]
-        fn minimal() {
-          let mut manager = BDDBManager::new(1024, 1024, 1);
-
-          let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-
-          let rel = manager
-            .relation("rel", vec![dom1.clone(), dom2.clone()])
-            .from_src(from(&[src.clone(), src.clone()]).tuple(&["A", "B"]).tuple(&["A", "C"]).factory())
-            .unwrap();
-          let sel = rel.select(vec![BDDSelect::One(dom2, src.value("C"))]).unwrap().into("sel");
-
-          let sat = sel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 1);
-        }
-        #[test]
-        fn empty() {
-          let mut manager = BDDBManager::new(1024, 1024, 1);
-
-          let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-
-          let rel = manager
-            .relation("rel", vec![dom1.clone(), dom2.clone()])
-            .from_src(from(&[src.clone(), src.clone()]).tuple(&["A", "B"]).tuple(&["A", "C"]).factory())
-            .unwrap();
-          let sel = rel.select(vec![BDDSelect::One(dom2.clone(), src.value("D"))]).unwrap().into("sel");
-
-          let sat = sel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 0);
+          expect!(sat).to_equal(4);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 1, 2, 2], vec![0, 1, 2, 3], vec![3, 2, 3, 0], vec![3, 2, 3, 3]]);
         }
       }
 
-      mod on_multiple_values {
+      mod on_multiple_domain_attributes {
         use super::*;
 
         #[test]
-        fn minimal() {
+        fn more1() {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
-          let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
+          let char_src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
+          let mut char_dom = manager.domain(name("char_dom"), char_src.size());
+          let char_dom_1 = char_dom.instance(1).unwrap();
+          let num_src = Arc::new(DomainSource::set_of(vec!["1", "2", "3", "4"]));
+          let mut num_dom = manager.domain(name("num_dom"), char_src.size());
+          let num_dom_1 = num_dom.instance(1).unwrap();
 
-          let rel = manager
-            .relation("rel", vec![dom1.clone(), dom2.clone()])
-            .from_src(from(&[src.clone(), src.clone()]).tuple(&["A", "B"]).tuple(&["A", "C"]).factory())
-            .unwrap();
-          let sel = rel.select(vec![BDDSelect::OneOf(dom2.clone(), vec![src.value("B"), src.value("C")])]).unwrap().into("sel");
-
-          let sat = sel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 2);
-        }
-
-        #[test]
-        fn empty() {
-          let mut manager = BDDBManager::new(1024, 1024, 1);
-
-          let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-
-          let rel = manager
-            .relation("rel", vec![dom1.clone(), dom2.clone()])
-            .from_src(from(&[src.clone(), src.clone()]).tuple(&["A", "B"]).tuple(&["A", "C"]).factory())
-            .unwrap();
-          let sel = rel.select(vec![BDDSelect::OneOf(dom2.clone(), vec![src.value("D"), src.value("A")])]).unwrap().into("sel");
-
-          let sat = sel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 0);
-        }
-      }
-
-      mod on_multiple_tuples {
-        use super::*;
-
-        #[test]
-        fn minimal() {
-          let mut manager = BDDBManager::new(1024, 1024, 1);
-
-          let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
-
-          let rel = manager
-            .relation("rel", vec![dom1.clone(), dom2.clone(), dom3.clone()])
+          let left = manager
+            .relation("left", vec![char_dom_1.clone(), num_dom_1.clone()])
             .from_src(
-              from(&[src.clone(), src.clone(), src.clone()])
-                .tuple(&["A", "B", "C"])
-                .tuple(&["A", "C", "A"])
-                .tuple(&["A", "D", "A"])
-                .tuple(&["D", "B", "C"])
+              from(&[char_src.clone(), num_src.clone()])
+                .tuple(&["A", "1"])
+                .tuple(&["C", "1"])
+                .tuple(&["D", "2"])
+                .tuple(&["C", "3"])
                 .factory(),
             )
             .unwrap();
-          let sel = rel
-            .select(vec![BDDSelect::Multiple(
-              vec![dom2.clone(), dom3.clone()],
-              vec![vec![src.value("B"), src.value("C")], vec![src.value("C"), src.value("A")]],
-            )])
-            .unwrap()
-            .into("a");
+          let right = manager.relation("right", vec![num_dom_1.clone()]).from_src(from(&[num_src.clone()]).tuple(&["1"]).factory()).unwrap();
+          let joint = left.join(&right).unwrap().into("joint");
 
-          let sat = sel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 3);
-        }
-
-        #[test]
-        fn empty() {
-          let mut manager = BDDBManager::new(1024, 1024, 1);
-
-          let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
-          let dom3 = dom.instance(name("dom3")).unwrap();
-
-          let rel = manager
-            .relation("rel", vec![dom1.clone(), dom2.clone(), dom3.clone()])
-            .from_src(
-              from(&[src.clone(), src.clone(), src.clone()])
-                .tuple(&["A", "B", "C"])
-                .tuple(&["A", "C", "A"])
-                .tuple(&["A", "D", "A"])
-                .tuple(&["D", "B", "C"])
-                .factory(),
-            )
-            .unwrap();
-          let sel = rel
-            .select(vec![BDDSelect::Multiple(
-              vec![dom2.clone(), dom3.clone()],
-              vec![vec![src.value("B"), src.value("B")], vec![src.value("C"), src.value("C")]],
-            )])
-            .unwrap()
-            .into("sel");
-
-          let sat = sel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 0);
+          let sat = joint.sat_count(manager.cache_count()).solutions().unwrap();
+          expect!(sat).to_equal(2);
+          expect!(joint.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0, 0], vec![2, 0]]);
         }
       }
     }
@@ -966,16 +898,15 @@ mod test {
       use super::*;
       mod on_single_attribute {
         use super::*;
-        use crate::bdd::domain::DomainSource;
 
         #[test]
         fn minimal() {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
 
           let rel = manager
             .relation("rel", vec![dom1.clone(), dom2.clone()])
@@ -984,7 +915,78 @@ mod test {
           let head = rel.project(&[dom1]).unwrap().into("head");
 
           let sat = head.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 1);
+          expect!(sat).to_equal(1);
+          expect!(head.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0]]);
+        }
+
+        #[test]
+        fn mixed_0() {
+          let mut manager = BDDBManager::new(1024, 1024, 1);
+
+          let char_src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
+          let mut char_dom = manager.domain(name("char_dom"), char_src.size());
+          let char_dom_1 = char_dom.instance(1).unwrap();
+          let num_src = Arc::new(DomainSource::set_of(vec!["1", "2", "3", "4"]));
+          let mut num_dom = manager.domain(name("dom2"), num_src.size());
+          let num_dom_1 = num_dom.instance(1).unwrap();
+
+          let rel = manager
+            .relation("rel", vec![num_dom_1.clone(), char_dom_1.clone()])
+            .from_src(from(&[num_src.clone(), char_src.clone()]).tuple(&["1", "A"]).tuple(&["2", "B"]).factory())
+            .unwrap();
+
+          let head = rel.project(&[num_dom_1]).unwrap().into("head");
+
+          let sat = head.sat_count(manager.cache_count()).solutions().unwrap();
+          expect!(sat).to_equal(2);
+          expect!(head.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0], vec![1]]);
+        }
+
+        #[test]
+        fn mixed_1() {
+          let mut manager = BDDBManager::new(1024, 1024, 1);
+
+          let char_src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
+          let mut char_dom = manager.domain(name("char_dom"), char_src.size());
+          let char_dom_1 = char_dom.instance(1).unwrap();
+          let num_src = Arc::new(DomainSource::set_of(vec!["1", "2", "3", "4"]));
+          let mut num_dom = manager.domain(name("num_dom"), num_src.size());
+          let num_dom_1 = num_dom.instance(1).unwrap();
+
+          let rel = manager
+            .relation("rel", vec![num_dom_1.clone(), char_dom_1.clone()])
+            .from_src(from(&[num_src.clone(), char_src.clone()]).tuple(&["1", "A"]).tuple(&["3", "B"]).factory())
+            .unwrap();
+
+          let first = rel.project(&[num_dom_1.clone()]).unwrap().into("first");
+
+          let sat = first.sat_count(manager.cache_count()).solutions().unwrap();
+          expect!(sat).to_equal(2);
+
+          expect!(first.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0], vec![2]]);
+        }
+
+        #[test]
+        fn mixed_2() {
+          let mut manager = BDDBManager::new(1024, 1024, 1);
+
+          let char_src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
+          let mut char_dom = manager.domain(name("char_dom"), char_src.size());
+          let char_dom_1 = char_dom.instance(1).unwrap();
+          let num_src = Arc::new(DomainSource::set_of(vec!["1", "2", "3", "4"]));
+          let mut num_dom = manager.domain(name("dom2"), num_src.size());
+          let num_dom_1 = num_dom.instance(1).unwrap();
+
+          let rel = manager
+            .relation("rel", vec![num_dom_1.clone(), char_dom_1.clone()])
+            .from_src(from(&[num_src.clone(), char_src.clone()]).tuple(&["1", "A"]).tuple(&["3", "B"]).factory())
+            .unwrap();
+
+          let second = rel.project(&[char_dom_1.clone()]).unwrap().into("second");
+
+          let sat = second.sat_count(manager.cache_count()).solutions().unwrap();
+          expect!(sat).to_equal(2);
+          expect!(second.solutions().collect::<Vec<Vec<u128>>>()).to_contain(vec![vec![0], vec![1]]);
         }
       }
     }
@@ -999,9 +1001,9 @@ mod test {
           let mut manager = BDDBManager::new(1024, 1024, 1);
 
           let src = Arc::new(DomainSource::set_of(vec!["A", "B", "C", "D"]));
-          let mut dom = manager.domain(src.size());
-          let dom1 = dom.instance(name("dom1")).unwrap();
-          let dom2 = dom.instance(name("dom2")).unwrap();
+          let mut dom = manager.domain(name("dom"), src.size());
+          let dom1 = dom.instance(1).unwrap();
+          let dom2 = dom.instance(2).unwrap();
 
           let rel1 = manager
             .relation("rel1", vec![dom1.clone(), dom2.clone()])
@@ -1014,7 +1016,7 @@ mod test {
           let rel = rel1.union(&rel2).unwrap().into("rel");
 
           let sat = rel.sat_count(manager.cache_count()).solutions().unwrap();
-          assert_eq!(sat, 2);
+          expect!(sat).to_equal(2);
         }
       }
     }

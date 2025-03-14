@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{self, Debug};
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -40,16 +40,17 @@ impl DomainSource {
 #[derive(Clone)]
 pub struct Domain {
   manager: BDDManagerRef,
+  name: Arc<str>,
   size: u128,
   domains: Vec<Arc<BDDDomain>>,
   uri: Option<Arc<str>>,
 }
 
 impl Domain {
-  pub fn new(manager: BDDManagerRef, size: u128) -> Domain {
+  pub fn new(manager: BDDManagerRef, name: Arc<str>, size: u128) -> Domain {
     let domains = Vec::new();
     let uri = None;
-    Domain { manager, size, domains, uri }
+    Domain { manager, name, size, domains, uri }
   }
 
   pub fn loaded_from(mut self, uri: Arc<str>) -> Self {
@@ -57,11 +58,11 @@ impl Domain {
     self
   }
 
-  pub fn instance(&mut self, name: Arc<str>) -> AllocResult<Arc<BDDDomain>> {
-    if let Some(found) = self.domains.iter().find(|domain| &domain.name == &name) {
+  pub fn instance(&mut self, id: u16) -> AllocResult<Arc<BDDDomain>> {
+    if let Some(found) = self.domains.iter().find(|domain| domain.id == id) {
       Ok(found.clone())
     } else {
-      let domain = Arc::new(BDDDomain::new(name, self.size, self.manager.clone())?);
+      let domain = Arc::new(BDDDomain::new(self.name.clone(), id, self.size, self.manager.clone())?);
       self.domains.push(domain.clone());
       Ok(domain)
     }
@@ -71,6 +72,7 @@ impl Domain {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct BDDDomain {
   pub name: Arc<str>,
+  pub id: u16,
   size: u128,
   range: (u32, u32),
   vars: Vec<BDDFunction>,
@@ -79,7 +81,12 @@ pub struct BDDDomain {
 
 impl Debug for BDDDomain {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("BDDDomain").field("name", &self.name).field("size", &self.size).field("range", &self.range).finish()
+    f.debug_struct("BDDDomain")
+      .field("name", &self.name)
+      .field("id", &self.id)
+      .field("size", &self.size)
+      .field("range", &self.range)
+      .finish()
   }
 }
 
@@ -101,7 +108,7 @@ impl PartialOrd for BDDDomain {
 }
 
 impl BDDDomain {
-  pub fn new(name: Arc<str>, size: u128, manager: BDDManagerRef) -> AllocResult<BDDDomain> {
+  pub fn new(name: Arc<str>, id: u16, size: u128, manager: BDDManagerRef) -> AllocResult<BDDDomain> {
     let (range, vars) = manager.with_manager_exclusive(|manager| {
       let start = manager.num_levels();
       let var_count = size.next_power_of_two().trailing_zeros() as usize;
@@ -112,30 +119,96 @@ impl BDDDomain {
       let end = start + vars.len() as u32;
       Ok(((start, end), vars))
     })?;
-    Ok(BDDDomain { name, size, range, vars, manager })
+    Ok(BDDDomain { name, id, size, range, vars, manager })
   }
 
   pub fn vars(&self) -> &[BDDFunction] {
     &self.vars
   }
 
-  pub fn value(&self, mut i: u128) -> AllocResult<BDDFunction> {
+  pub fn value(&self, i: u128) -> AllocResult<BDDFunction> {
     let BDDDomain { manager, vars, .. } = self;
     manager.with_manager_shared(|manager| {
-      if i >= self.size as u128 {
+      let mut value = i;
+      if value >= self.size as u128 {
         return Ok(BDDFunction::f(manager));
       }
-      let mut value = BDDFunction::t(manager);
+      let mut domain = BDDFunction::t(manager);
       for var in vars.iter().rev() {
-        if (i & 0b1) == 1 {
-          value = value.and(&var)?;
+        if (value & 0b1) == 1 {
+          domain = domain.and(&var)?;
         } else {
-          value = value.and(&var.not()?)?;
+          domain = domain.and(&var.not()?)?;
         }
-        i = i >> 1;
+        value = value >> 1;
       }
-      Ok(value)
+      Ok(domain)
     })
+  }
+
+  pub fn value_lt(&self, i: u128) -> AllocResult<BDDFunction> {
+    let BDDDomain { manager, vars, .. } = self;
+    manager.with_manager_shared(|manager| {
+      let mut value = i;
+      let mut var_bindings = VecDeque::with_capacity(vars.len());
+      for var in vars.iter().rev() {
+        let binding = (value & 0b1) == 1;
+        var_bindings.push_front((var.clone(), binding));
+        value = value >> 1;
+      }
+      let mut domain = BDDFunction::f(manager);
+      let mut prefix = BDDFunction::t(manager);
+      for (var, binding) in var_bindings {
+        if binding {
+          let next = prefix.and(&var.not()?)?;
+
+          domain = domain.or(&next)?;
+          prefix = prefix.and(&var)?;
+        } else {
+          prefix = prefix.and(&var.not()?)?;
+        }
+      }
+      Ok(domain)
+    })
+  }
+
+  pub fn value_le(&self, i: u128) -> AllocResult<BDDFunction> {
+    let BDDDomain { manager, vars, .. } = self;
+    manager.with_manager_shared(|manager| {
+      let mut value = i;
+      let mut var_bindings = VecDeque::with_capacity(vars.len());
+      for var in vars.iter().rev() {
+        let binding = (value & 0b1) == 1;
+        var_bindings.push_front((var.clone(), binding));
+        value = value >> 1;
+      }
+      let mut domain = BDDFunction::f(manager);
+      let mut prefix = BDDFunction::t(manager);
+      for (var, binding) in var_bindings {
+        if binding {
+          let next = prefix.and(&var.not()?)?;
+
+          domain = domain.or(&next)?;
+          prefix = prefix.and(&var)?;
+        } else {
+          prefix = prefix.and(&var.not()?)?;
+        }
+      }
+      domain = domain.or(&prefix)?;
+      Ok(domain)
+    })
+  }
+
+  pub fn value_gt(&self, i: u128) -> AllocResult<BDDFunction> {
+    self.value_le(i)?.not()
+  }
+
+  pub fn value_ge(&self, i: u128) -> AllocResult<BDDFunction> {
+    self.value_lt(i)?.not()
+  }
+
+  pub fn value_ne(&self, i: u128) -> AllocResult<BDDFunction> {
+    self.value(i)?.not()
   }
 
   pub fn values(&self, is: Vec<u128>) -> AllocResult<BDDFunction> {
@@ -163,19 +236,17 @@ impl BDDDomain {
 
   pub fn domain(&self) -> AllocResult<BDDFunction> {
     let BDDDomain { manager, vars, .. } = self;
-    manager.with_manager_shared(|manager| {
-      let mut domain = BDDFunction::t(manager);
-      let mut value = self.size - 1;
-      for var in vars {
-        if (value & 0b1) == 1 {
-          domain = domain.or(&var.not()?)?;
-        } else {
-          domain = domain.and(&var.not()?)?;
-        }
-        value = value >> 1;
+    let mut domain = manager.with_manager_shared(|manager| BDDFunction::t(manager));
+    let mut value = self.size - 1;
+    for var in vars {
+      if (value & 0b1) == 1 {
+        domain = domain.or(&var.not()?)?;
+      } else {
+        domain = domain.and(&var.not()?)?;
       }
-      Ok(domain)
-    })
+      value = value >> 1;
+    }
+    Ok(domain)
   }
 
   pub fn set(&self) -> AllocResult<BDDFunction> {
@@ -207,34 +278,259 @@ impl BDDDomain {
   }
 }
 
-pub enum BDDSelect {
-  One(Arc<BDDDomain>, u128),
-  OneOf(Arc<BDDDomain>, Vec<u128>),
-  Multiple(Vec<Arc<BDDDomain>>, Vec<Vec<u128>>),
-}
-
 #[cfg(test)]
 mod test {
   use std::hash::BuildHasherDefault;
 
+  use crate::expect;
+  use crate::testutil::core::{Locatable, expect};
+  use crate::testutil::matchers::equal_to::EqualTo;
   use oxidd::util::{FxHasher, SatCountCache};
 
   use super::*;
   mod bdd_domain {
     use super::*;
 
+    mod values {
+
+      use super::*;
+
+      #[test]
+      fn eq() {
+        let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
+
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
+
+        let bdd = domain.value(0).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value(1).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value(2).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value(3).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+      }
+
+      #[test]
+      fn lt() {
+        let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
+
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
+
+        let bdd = domain.value_lt(0).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_lt(1).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_lt(2).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_lt(3).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+      }
+
+      #[test]
+      fn le() {
+        let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
+
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
+
+        let bdd = domain.value_le(0).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_le(1).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_le(2).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_le(3).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+      }
+
+      #[test]
+      fn gt() {
+        let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
+
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
+
+        let bdd = domain.value_gt(0).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_gt(1).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_gt(2).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_gt(3).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+      }
+
+      #[test]
+      fn ge() {
+        let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
+
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
+
+        let bdd = domain.value_ge(0).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_ge(1).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_ge(2).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_ge(3).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+      }
+
+      #[test]
+      fn ne() {
+        let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
+
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
+
+        let bdd = domain.value_ne(0).unwrap();
+
+        assert!(!bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_ne(1).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(!bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_ne(2).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(!bdd.eval(vars(&domain, 2)));
+        assert!(bdd.eval(vars(&domain, 3)));
+
+        let bdd = domain.value_ne(3).unwrap();
+
+        assert!(bdd.eval(vars(&domain, 0)));
+        assert!(bdd.eval(vars(&domain, 1)));
+        assert!(bdd.eval(vars(&domain, 2)));
+        assert!(!bdd.eval(vars(&domain, 3)));
+      }
+
+      fn vars(domain: &BDDDomain, mut i: u128) -> Vec<(&BDDFunction, bool)> {
+        let mut vars = Vec::new();
+        for var in domain.vars().iter().rev() {
+          if i & 0b1 == 1 {
+            vars.push((var, true));
+          } else {
+            vars.push((var, false));
+          }
+          i = i >> 1;
+        }
+        vars
+      }
+    }
     mod sat_count {
       use super::*;
+
       #[test]
       fn all_in_domain_exaustive() {
         let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
         let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-        let domain = BDDDomain::new(Arc::from("test1"), 4, manager_ref.clone()).unwrap();
+        let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
 
         let all = domain.domain().unwrap();
         let sat = domain.sat_count(&all, &mut count_cache).solutions().unwrap();
-        assert_eq!(sat, 4);
+        expect!(sat).to_equal(4);
       }
 
       #[test]
@@ -242,11 +538,11 @@ mod test {
         let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
         let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-        let domain = BDDDomain::new(Arc::from("test1"), 3, manager_ref.clone()).unwrap();
+        let domain = BDDDomain::new(Arc::from("test"), 1, 3, manager_ref.clone()).unwrap();
 
         let all = domain.domain().unwrap();
         let sat = domain.sat_count(&all, &mut count_cache).solutions().unwrap();
-        assert_eq!(sat, 3);
+        expect!(sat).to_equal(3);
       }
 
       mod subsets {
@@ -257,7 +553,7 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let domain = BDDDomain::new(Arc::from("test1"), 4, manager_ref.clone()).unwrap();
+          let domain = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
 
           let v0 = domain.value(0).unwrap();
           let v1 = domain.value(1).unwrap();
@@ -265,7 +561,7 @@ mod test {
           let v3 = domain.value(3).unwrap();
           let v0123 = v0.or(&v1).unwrap().or(&v2).unwrap().or(&v3).unwrap();
           let sat = domain.sat_count(&v0123, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat, 4);
+          expect!(sat).to_equal(4);
         }
 
         #[test]
@@ -273,12 +569,12 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let domain = BDDDomain::new(Arc::from("test1"), 8, manager_ref.clone()).unwrap();
+          let domain = BDDDomain::new(Arc::from("test"), 1, 8, manager_ref.clone()).unwrap();
 
           let v0 = domain.value(0).unwrap();
 
           let sat = domain.sat_count(&v0, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat, 1);
+          expect!(sat).to_equal(1);
         }
 
         #[test]
@@ -286,7 +582,7 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let domain = BDDDomain::new(Arc::from("test1"), 8, manager_ref.clone()).unwrap();
+          let domain = BDDDomain::new(Arc::from("test"), 1, 8, manager_ref.clone()).unwrap();
 
           let v0 = domain.value(0).unwrap();
           let v4 = domain.value(4).unwrap();
@@ -294,7 +590,7 @@ mod test {
           let v04 = v0.or(&v4).unwrap();
 
           let sat = domain.sat_count(&v04, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat, 2);
+          expect!(sat).to_equal(2);
         }
 
         #[test]
@@ -302,12 +598,12 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let domain = BDDDomain::new(Arc::from("test1"), 7, manager_ref.clone()).unwrap();
+          let domain = BDDDomain::new(Arc::from("test"), 1, 7, manager_ref.clone()).unwrap();
 
           let v1 = domain.value(7).unwrap();
 
           let sat = domain.sat_count(&v1, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat, 0);
+          expect!(sat).to_equal(0);
         }
       }
 
@@ -320,21 +616,21 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let d1 = BDDDomain::new(Arc::from("test1"), 4, manager_ref.clone()).unwrap();
+          let d1 = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
           let d1_0 = d1.value(0).unwrap();
 
-          let d2 = BDDDomain::new(Arc::from("test2"), 4, manager_ref.clone()).unwrap();
+          let d2 = BDDDomain::new(Arc::from("test"), 2, 4, manager_ref.clone()).unwrap();
           let d2_1 = d2.value(1).unwrap();
 
-          let d3 = BDDDomain::new(Arc::from("test3"), 4, manager_ref.clone()).unwrap();
+          let d3 = BDDDomain::new(Arc::from("test"), 3, 4, manager_ref.clone()).unwrap();
           let d3_2 = d3.value(2).unwrap();
 
           let sat1 = d1.sat_count(&d1_0, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat1, 1);
+          expect!(sat1).to_equal(1);
           let sat2 = d2.sat_count(&d2_1, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat2, 1);
+          expect!(sat2).to_equal(1);
           let sat3 = d3.sat_count(&d3_2, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat3, 1);
+          expect!(sat3).to_equal(1);
         }
 
         #[test]
@@ -342,18 +638,18 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let d1 = BDDDomain::new(Arc::from("test1"), 4, manager_ref.clone()).unwrap();
+          let d1 = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
 
-          let d2 = BDDDomain::new(Arc::from("test2"), 4, manager_ref.clone()).unwrap();
+          let d2 = BDDDomain::new(Arc::from("test"), 2, 4, manager_ref.clone()).unwrap();
           let d2_1 = d2.value(1).unwrap();
 
-          let d3 = BDDDomain::new(Arc::from("test3"), 4, manager_ref.clone()).unwrap();
+          let d3 = BDDDomain::new(Arc::from("test"), 3, 4, manager_ref.clone()).unwrap();
           let d3_2 = d3.value(2).unwrap();
 
           let sat1 = d1.sat_count(&d2_1, &mut count_cache).solutions().unwrap();
           let sat2 = d2.sat_count(&d3_2, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat1, 0);
-          assert_eq!(sat2, 0);
+          expect!(sat1).to_equal(0);
+          expect!(sat2).to_equal(0);
         }
 
         #[test]
@@ -361,18 +657,18 @@ mod test {
           let manager_ref = oxidd::bdd::new_manager(1024, 1024, 1);
           let mut count_cache: SatCountCache<ShiftCounter, BuildHasherDefault<FxHasher>> = SatCountCache::default();
 
-          let d1 = BDDDomain::new(Arc::from("test1"), 4, manager_ref.clone()).unwrap();
+          let d1 = BDDDomain::new(Arc::from("test"), 1, 4, manager_ref.clone()).unwrap();
           let d1_0 = d1.value(0).unwrap();
 
-          let d2 = BDDDomain::new(Arc::from("test2"), 4, manager_ref.clone()).unwrap();
+          let d2 = BDDDomain::new(Arc::from("test"), 2, 4, manager_ref.clone()).unwrap();
           let d2_1 = d2.value(1).unwrap();
 
-          let d3 = BDDDomain::new(Arc::from("test3"), 4, manager_ref.clone()).unwrap();
+          let d3 = BDDDomain::new(Arc::from("test"), 3, 4, manager_ref.clone()).unwrap();
 
           let sat2 = d2.sat_count(&d1_0, &mut count_cache).solutions().unwrap();
           let sat3 = d3.sat_count(&d2_1, &mut count_cache).solutions().unwrap();
-          assert_eq!(sat2, 0);
-          assert_eq!(sat3, 0);
+          expect!(sat2).to_equal(0);
+          expect!(sat3).to_equal(0);
         }
       }
     }

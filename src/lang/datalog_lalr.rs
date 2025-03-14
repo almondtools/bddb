@@ -14,7 +14,8 @@ use super::ast::{Literal, PrefixLiteral, TermTuple};
 #[derive(PartialEq, Debug, Clone)]
 pub enum SemanticError {
   UnknownDomain(String),
-  UnknownRelation(String)
+  UnknownRelation(String),
+  MissingType(String)
 }
 
 #[derive(PartialEq, Debug, Clone)]

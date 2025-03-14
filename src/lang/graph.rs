@@ -1,15 +1,17 @@
 use std::borrow::Borrow;
-use std::cell::RefCell;
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::{Debug, Display};
+use std::fs::File;
+use std::io::Write;
+use std::mem::replace;
+use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
-
-use oxidd::bdd::BDDManagerRef;
-
-use crate::bdd::domain::BDDDomain;
 
 use super::datalog_lalr::SemanticError;
 
-use super::ast;
+use super::ast::{self, InfixLiteral, Operator};
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct Domain {
@@ -28,20 +30,42 @@ pub fn local_domain(name: Arc<str>, size: u128, uri: Arc<str>) -> Arc<Domain> {
   Arc::new(Domain::new(name, size, uri))
 }
 
-#[derive(PartialEq, Debug)]
-pub enum Store {
-  From(Arc<str>),
-  To(Arc<str>),
-  Mem,
+#[derive(PartialEq, Debug, Clone)]
+pub enum Value {
+  Str(Arc<str>),
+  Ord(u128),
+  Bool(bool),
 }
 
-#[derive(PartialEq, Debug)]
+impl Display for Value {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Value::Str(s) => write!(f, "\"{}\"", s),
+      Value::Ord(o) => write!(f, "{}", o),
+      Value::Bool(b) => write!(f, "{}", b),
+    }
+  }
+}
+
+#[derive(PartialEq, Debug, Clone)]
 pub enum Term {
   Var(Arc<str>),
   Str(Arc<str>),
   Ord(u128),
   Bool(bool),
   Any,
+}
+
+impl Display for Term {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Term::Var(s) => write!(f, "{}", s),
+      Term::Str(s) => write!(f, "\"{}\"", s),
+      Term::Ord(o) => write!(f, "{}", o),
+      Term::Bool(b) => write!(f, "{}", b),
+      Term::Any => write!(f, "_"),
+    }
+  }
 }
 
 impl Term {
@@ -54,90 +78,293 @@ impl Term {
       ast::Term::Any => Term::Any,
     }
   }
-}
 
-#[derive(PartialEq, Debug)]
-pub enum Sign {
-  None,
-  Not,
-}
-
-#[derive(PartialEq, Debug)]
-pub struct Atom {
-  sign: Sign,
-  name: Arc<str>,
-  terms: Vec<Term>,
-}
-
-impl Atom {
-  pub fn new(name: Arc<str>, terms: Vec<Term>) -> Atom {
-    let sign = Sign::None;
-    Atom { sign, name, terms }
-  }
-
-  pub fn neg(name: Arc<str>, terms: Vec<Term>) -> Atom {
-    let sign = Sign::Not;
-    Atom { sign, name, terms }
-  }
-
-  pub fn predicate(&self) -> (Arc<str>, usize) {
-    (self.name.clone(), self.terms.len())
-  }
-}
-
-#[derive(PartialEq, Debug)]
-pub struct Node {
-  kind: NodeKind,
-  depends_on: RefCell<Vec<Arc<Node>>>,
-}
-
-impl Node {
-  pub fn new(kind: NodeKind) -> Node {
-    let depends_on = RefCell::new(Vec::new());
-    Node { kind, depends_on }
-  }
-
-  pub fn depend_on<I: IntoIterator<Item = Arc<Node>>>(&self, iter: I) {
-    self.depends_on.borrow_mut().extend(iter);
-  }
-
-  pub fn accept<V: NodeVisitor>(&self, visitor: &mut V) {
-    match &self.kind {
-      NodeKind::Relation { name, attributes, store } => {
-        visitor.visit_relation(name, attributes, store, self.depends_on.borrow().as_ref());
-      }
-      NodeKind::Rule { head, body } => {
-        visitor.visit_rule(head, body, self.depends_on.borrow().as_ref());
-      }
+  pub fn as_value(&self) -> Option<Value> {
+    match self {
+      Term::Str(s) => Some(Value::Str(s.clone())),
+      Term::Ord(o) => Some(Value::Ord(*o)),
+      Term::Bool(b) => Some(Value::Bool(*b)),
+      _ => None,
     }
   }
 }
 
-pub fn relation_node(name: Arc<str>, attributes: Vec<Arc<Domain>>, store: Store) -> Arc<Node> {
-  Arc::new(Node::new(NodeKind::Relation { name, attributes, store }))
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum Cmp {
+  EQ,
+  NE,
+  GT,
+  GE,
+  LT,
+  LE,
 }
 
-pub fn rule_node(head: Atom, body: Vec<Atom>) -> Arc<Node> {
-  Arc::new(Node::new(NodeKind::Rule { head, body }))
+impl Cmp {
+  pub fn from(op: Operator) -> Cmp {
+    match op {
+      Operator::Equal => Cmp::EQ,
+      Operator::NotEqual => Cmp::NE,
+      Operator::Greater => Cmp::GT,
+      Operator::GreaterEqual => Cmp::GE,
+      Operator::Less => Cmp::LT,
+      Operator::LessEqual => Cmp::LE,
+    }
+  }
+}
+
+impl Display for Cmp {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Cmp::EQ => write!(f, "="),
+      Cmp::NE => write!(f, "!="),
+      Cmp::GT => write!(f, ">"),
+      Cmp::GE => write!(f, ">="),
+      Cmp::LT => write!(f, "<"),
+      Cmp::LE => write!(f, "<="),
+    }
+  }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum Atom {
+  Pos(Arc<str>, Vec<Term>),
+  Neg(Arc<str>, Vec<Term>),
+  Constraint { left: Term, cmp: Cmp, right: Term },
+}
+
+impl Display for Atom {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Atom::Pos(name, terms) => write!(f, "{}({})", name, terms.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ")),
+      Atom::Neg(name, terms) => write!(f, "~{}({})", name, terms.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ")),
+      Atom::Constraint { left, cmp, right } => write!(f, "{} {} {}", left, cmp, right),
+    }
+  }
+}
+
+impl Atom {
+  pub fn predicate(&self) -> Option<(Arc<str>, usize)> {
+    match self {
+      Atom::Pos(name, terms) => Some((name.clone(), terms.len())),
+      Atom::Neg(name, terms) => Some((name.clone(), terms.len())),
+      _ => None,
+    }
+  }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct NodeAttributes<T: Clone + Debug> {
+  store: Vec<Option<T>>,
+}
+
+impl<T: Clone + Debug> NodeAttributes<T> {
+  pub fn new() -> Self {
+    NodeAttributes { store: Vec::new() }
+  }
+
+  pub fn with_capacity(capacity: usize) -> Self {
+    NodeAttributes { store: Vec::with_capacity(capacity) }
+  }
+
+  pub fn set(&mut self, id: u16, value: T) {
+    let id = id as usize;
+    if self.store.len() <= id {
+      self.store.resize(id + 1, None);
+    }
+    self.store[id] = Some(value);
+  }
+
+  pub fn get(&self, id: u16) -> Option<&T> {
+    let id = id as usize;
+    if self.store.len() <= id {
+      return None;
+    }
+    (&self.store[id]).as_ref()
+  }
+
+  pub fn get_mut(&mut self, id: u16) -> Option<&mut T> {
+    let id = id as usize;
+    if self.store.len() <= id {
+      return None;
+    }
+    (&mut self.store[id]).as_mut()
+  }
+
+  pub fn entry(&mut self, id: u16) -> NodeAttribute<'_, T> {
+    let id = id as usize;
+    if self.store.len() <= id {
+      self.store.resize(id + 1, None);
+    }
+    NodeAttribute { att: &mut self.store[id] }
+  }
+
+  pub fn contains(&self, id: u16) -> bool {
+    let id = id as usize;
+    self.store.len() > id && self.store[id].is_some()
+  }
+
+  pub fn clear(&mut self) {
+    self.store.clear();
+  }
+}
+
+impl<T: Clone + Debug> FromIterator<(u16, T)> for NodeAttributes<T> {
+  fn from_iter<I: IntoIterator<Item = (u16, T)>>(iter: I) -> Self {
+    let iter = iter.into_iter();
+    let (min_size, max_size) = iter.size_hint();
+    let capacity = max_size.unwrap_or(min_size);
+
+    let mut store = Vec::with_capacity(capacity);
+    for (id, value) in iter {
+      if store.len() <= (id as usize) {
+        store.resize(id as usize + 1, None);
+      }
+      store[id as usize] = Some(value);
+    }
+    NodeAttributes { store }
+  }
+}
+
+pub struct NodeAttribute<'a, T> {
+  att: &'a mut Option<T>,
+}
+
+impl<'a, T> NodeAttribute<'a, T> {
+  pub fn and_modify(self, modify: impl FnOnce(&mut T)) -> NodeAttribute<'a, T> {
+    if let Some(value) = self.att {
+      modify(value);
+    }
+    self
+  }
+
+  pub fn or_insert_with(self, value: impl FnOnce() -> T) -> &'a mut T {
+    if let Some(val) = self.att {
+      val
+    } else {
+      *self.att = Some(value());
+      self.att.as_mut().unwrap()
+    }
+  }
+}
+
+pub struct Node {
+  pub id: u16,
+  pub kind: NodeKind,
+  pub depends_on: RefCell<Vec<Rc<Node>>>,
+}
+
+impl Node {
+  pub fn new(id: u16, kind: NodeKind) -> Node {
+    let depends_on = RefCell::new(Vec::new());
+    Node { id, kind, depends_on }
+  }
+
+  pub fn depend_on<I: IntoIterator<Item = Rc<Node>>>(&self, iter: I) {
+    self.depends_on.borrow_mut().extend(iter);
+  }
+
+  pub fn accept<E, V: NodeVisitor<E>>(&self, visitor: &mut V) -> Result<(), E> {
+    let id = self.id;
+    match &self.kind {
+      NodeKind::Store(store) => visitor.visit_store(id, store, self.depends_on.borrow().as_ref()),
+      NodeKind::Source(store) => visitor.visit_source(id, store, self.depends_on.borrow().as_ref()),
+      NodeKind::Relation { name, attributes } => visitor.visit_relation(id, name, attributes, self.depends_on.borrow().as_ref()),
+      NodeKind::Rule { head, body } => visitor.visit_rule(id, head, body, self.depends_on.borrow().as_ref()),
+      NodeKind::Component { name, attributes } => visitor.visit_component(id, name, attributes, self.depends_on.borrow().as_ref()),
+      NodeKind::Prefetch => visitor.visit_prefetch(id, self.depends_on.borrow().as_ref()),
+    }
+  }
+}
+
+impl PartialEq for Node {
+  fn eq(&self, other: &Self) -> bool {
+    self.id == other.id && self.kind == other.kind
+  }
+}
+
+impl Debug for Node {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Node").field("id", &self.id).field("kind", &self.kind).finish()
+  }
 }
 
 #[derive(PartialEq, Debug)]
 pub enum NodeKind {
-  Relation { name: Arc<str>, attributes: Vec<Arc<Domain>>, store: Store },
+  Store(Arc<str>),
+  Source(Arc<str>),
+  Relation { name: Arc<str>, attributes: Vec<Arc<Domain>> },
   Rule { head: Atom, body: Vec<Atom> },
+  Component { name: Arc<str>, attributes: Vec<Arc<Domain>> },
+  Prefetch,
 }
 
-pub trait NodeVisitor {
-  fn visit_relation(&mut self, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, store: &Store, depends_on: &Vec<Arc<Node>>);
-  fn visit_rule(&mut self, head: &Atom, body: &Vec<Atom>, depends_on: &Vec<Arc<Node>>);
+pub struct NodeFactory {
+  id: Cell<u16>,
+  nodes: HashMap<u16, Rc<Node>>,
+}
+
+impl NodeFactory {
+  pub fn new() -> Self {
+    NodeFactory { id: 0.into(), nodes: HashMap::new() }
+  }
+
+  pub fn node(&self, id: u16) -> Option<Rc<Node>> {
+    self.nodes.get(&id).cloned()
+  }
+
+  pub fn store(&mut self, store: Arc<str>) -> Rc<Node> {
+    self.next_node(NodeKind::Store(store))
+  }
+
+  pub fn source(&mut self, store: Arc<str>) -> Rc<Node> {
+    self.next_node(NodeKind::Source(store))
+  }
+
+  pub fn relation(&mut self, name: Arc<str>, attributes: Vec<Arc<Domain>>) -> Rc<Node> {
+    self.next_node(NodeKind::Relation { name, attributes })
+  }
+
+  pub fn rule(&mut self, head: Atom, body: Vec<Atom>) -> Rc<Node> {
+    self.next_node(NodeKind::Rule { head, body })
+  }
+
+  pub fn component(&mut self, name: Arc<str>, attributes: Vec<Arc<Domain>>, root: Rc<Node>) -> Rc<Node> {
+    let component = self.next_node(NodeKind::Component { name, attributes });
+    component.depend_on(Some(root));
+    component
+  }
+
+  pub fn prefetch(&mut self, node: Rc<Node>) -> Rc<Node> {
+    let prefetch = self.next_node(NodeKind::Prefetch);
+    prefetch.depend_on(Some(node));
+    prefetch
+  }
+
+  fn next_node(&mut self, kind: NodeKind) -> Rc<Node> {
+    let id = self.id.update(|id| id + 1);
+    let node = Rc::new(Node::new(id, kind));
+    self.nodes.insert(id, node.clone());
+    node
+  }
+}
+
+pub trait NodeVisitor<E> {
+  fn visit_store(&mut self, id: u16, store: &Arc<str>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
+  fn visit_source(&mut self, id: u16, store: &Arc<str>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
+  fn visit_relation(&mut self, id: u16, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
+  fn visit_rule(&mut self, id: u16, head: &Atom, body: &Vec<Atom>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
+  fn visit_component(&mut self, id: u16, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
+  fn visit_prefetch(&mut self, id: u16, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
 }
 
 pub struct RuleGraph {
   names: HashSet<Arc<str>>,
-  domains: HashMap<Arc<str>, Arc<Domain>>,
-  relations: HashMap<(Arc<str>, usize), Arc<Node>>,
-  rules: HashMap<(Arc<str>, usize), Vec<Arc<Node>>>,
-  roots: Vec<Arc<Node>>,
+  relations: HashMap<(Arc<str>, usize), Rc<Node>>,
+  rules: HashMap<(Arc<str>, usize), Vec<Rc<Node>>>,
+  create: NodeFactory,
+
+  pub domains: HashMap<Arc<str>, Arc<Domain>>,
+  pub roots: Vec<Rc<Node>>,
 }
 
 impl RuleGraph {
@@ -147,12 +374,14 @@ impl RuleGraph {
     let relations = HashMap::new();
     let rules = HashMap::new();
     let roots = Vec::new();
+    let create = NodeFactory::new();
     RuleGraph {
       names,
       domains,
       relations,
       rules,
       roots,
+      create,
     }
   }
 
@@ -169,6 +398,7 @@ impl RuleGraph {
   pub fn insert(mut self, spec: ast::Spec) -> Result<Self, SemanticError> {
     self.register_domains(spec.domains)?;
     self.collect_nodes(spec.relations, spec.rules)?;
+    self.extract_components()?;
     Ok(self)
   }
 
@@ -199,7 +429,7 @@ impl RuleGraph {
           todo.extend(new_rules);
         }
         NodeKind::Rule { body, .. } => {
-          let body = body.iter().map(|a| a.predicate()).collect::<Vec<_>>();
+          let body = body.iter().flat_map(|a| a.predicate()).collect::<Vec<_>>();
           let known_relations = self.fetch_known_relations(&body);
           let new_relations = self.fetch_relations(&body, &mut relations)?;
 
@@ -210,12 +440,13 @@ impl RuleGraph {
 
           todo.extend(new_relations);
         }
+        _ => todo.extend(node.depends_on.borrow().iter().cloned()),
       }
     }
     Ok(())
   }
 
-  fn fetch_goals(&mut self, relations: &mut Vec<ast::Relation>) -> Result<Vec<Arc<Node>>, SemanticError> {
+  fn fetch_goals(&mut self, relations: &mut Vec<ast::Relation>) -> Result<Vec<Rc<Node>>, SemanticError> {
     let mut goals = Vec::new();
     for relation in relations.extract_if(.., |relation| relation.is_stored()) {
       let store = self.name(relation.store().unwrap().as_ref());
@@ -223,62 +454,76 @@ impl RuleGraph {
       let name = self.name(signature.name.as_ref());
       let attributes = signature.attributes.iter().map(|s| self.name(s.as_ref())).collect::<Vec<_>>();
       let attributes = self.fetch_attributes(&attributes)?;
-      let store = Store::To(store);
       let predicate = (name.clone(), attributes.len());
-      let goal = relation_node(name, attributes, store);
-      self.roots.push(goal.clone());
-      self.relations.insert(predicate, goal.clone());
+      let relation = self.create.relation(name, attributes);
+      let root = self.create.store(store);
+      root.depend_on(Some(relation.clone()));
+      self.roots.push(root.clone());
+      self.relations.insert(predicate, relation);
 
-      goals.push(goal);
+      goals.push(root);
     }
     Ok(goals)
   }
 
-  fn fetch_known_relations(&self, body: &[(Arc<str>, usize)]) -> Vec<Arc<Node>> {
+  fn fetch_known_relations(&self, body: &[(Arc<str>, usize)]) -> Vec<Rc<Node>> {
     let nodes = body.iter().flat_map(|(name, arity)| self.relations.get(&(name.clone(), *arity))).cloned().collect();
     nodes
   }
 
-  fn fetch_relations(&mut self, body: &[(Arc<str>, usize)], relations: &mut Vec<ast::Relation>) -> Result<Vec<Arc<Node>>, SemanticError> {
+  fn fetch_relations(&mut self, body: &[(Arc<str>, usize)], relations: &mut Vec<ast::Relation>) -> Result<Vec<Rc<Node>>, SemanticError> {
     let mut nodes = Vec::new();
     for relation in relations.extract_if(.., |relation| body.iter().any(|(name, arity)| relation.signature().matches(name.as_ref(), *arity))) {
       let signature = relation.signature();
       let name = self.name(signature.name.as_ref());
       let attributes = signature.attributes.iter().map(|s| self.name(s.as_ref())).collect::<Vec<_>>();
       let attributes = self.fetch_attributes(&attributes)?;
-      let store = match relation {
-        ast::Relation::From(_, uri) => Store::From(self.name(uri)),
-        ast::Relation::To(_, uri) => Store::To(self.name(uri)),
-        ast::Relation::Mem(_) => Store::Mem,
-      };
       let predicate = (name.clone(), attributes.len());
-      let node = relation_node(name, attributes, store);
+      let node = self.create.relation(name, attributes);
+      if let Some(uri) = relation.source() {
+        let source = self.name(uri.as_ref());
+        let source = self.create.source(source);
+        node.depend_on(Some(source));
+      }
       self.relations.insert(predicate, node.clone());
       nodes.push(node);
     }
     Ok(nodes)
   }
 
-  fn fetch_known_rules(&self, predicate: &(Arc<str>, usize)) -> Vec<Arc<Node>> {
+  fn fetch_known_rules(&self, predicate: &(Arc<str>, usize)) -> Vec<Rc<Node>> {
     if let Some(nodes) = self.rules.get(predicate) { nodes.clone() } else { Vec::new() }
   }
 
-  fn fetch_rules(&mut self, (name, arity): &(Arc<str>, usize), rules: &mut Vec<ast::Rule>) -> Result<Vec<Arc<Node>>, SemanticError> {
+  fn fetch_rules(&mut self, (name, arity): &(Arc<str>, usize), rules: &mut Vec<ast::Rule>) -> Result<Vec<Rc<Node>>, SemanticError> {
     let mut nodes = Vec::new();
     for rule in rules.extract_if(.., |rule| rule.head.name.as_ref() == name.as_ref() && rule.head.terms.len() == *arity) {
       let predicate = (name.clone(), *arity);
 
-      let head = Atom::new(self.name(rule.head.name), rule.head.terms.into_iter().map(|term| Term::from(term)).collect());
-      let body = rule
+      let mut head = Atom::Pos(self.name(rule.head.name), rule.head.terms.into_iter().map(|term| Term::from(term)).collect());
+      let mut body = rule
         .body
         .into_iter()
         .map(|atom| match atom {
-          ast::Literal::Positive(atom) => Atom::new(self.name(atom.name), atom.terms.into_iter().map(|term| Term::from(term)).collect()),
-          ast::Literal::Negative(atom) => Atom::neg(self.name(atom.name), atom.terms.into_iter().map(|term| Term::from(term)).collect()),
-          ast::Literal::Comparative(_) => todo!(),
+          ast::Literal::Positive(atom) => Atom::Pos(self.name(atom.name), atom.terms.into_iter().map(|term| Term::from(term)).collect()),
+          ast::Literal::Negative(atom) => Atom::Neg(self.name(atom.name), atom.terms.into_iter().map(|term| Term::from(term)).collect()),
+          ast::Literal::Comparative(InfixLiteral { left, op, right }) => Atom::Constraint {
+            left: Term::from(left),
+            cmp: Cmp::from(op),
+            right: Term::from(right),
+          },
         })
-        .collect();
-      let node = rule_node(head, body);
+        .collect::<Vec<_>>();
+
+      let mut counter = 0usize;
+      let mut constraints = Vec::new();
+      normalize_atom(&mut head, &mut constraints, &mut counter);
+      for atom in &mut body {
+        normalize_atom(atom, &mut constraints, &mut counter);
+      }
+      body.extend(constraints);
+
+      let node = self.create.rule(head, body);
       self.rules.entry(predicate).or_insert_with(Vec::new).push(node.clone());
       nodes.push(node);
     }
@@ -299,7 +544,7 @@ impl RuleGraph {
     Ok(attributes)
   }
 
-  fn check_definitions<'a, I: IntoIterator<Item = &'a Arc<Node>>>(&self, body: &[(Arc<str>, usize)], relations: I) -> Result<(), SemanticError> {
+  fn check_definitions<'a, I: IntoIterator<Item = &'a Rc<Node>>>(&self, body: &[(Arc<str>, usize)], relations: I) -> Result<(), SemanticError> {
     let mut relations = relations.into_iter();
     let mut predicates = Vec::new();
     'next_node: for pred in body {
@@ -322,377 +567,425 @@ impl RuleGraph {
     Ok(())
   }
 
-  pub fn accept<V: RuleGraphVisitor>(&self, visitor: &mut V) {
-    visitor.visit_graph(self);
+  pub fn extract_components(&mut self) -> Result<(), SemanticError> {
+    let nodes = self.roots.clone();
+
+    let mut tarjan_scc = TarjanSCC::new();
+
+    let mut nodes2sccs: HashMap<u16, u16> = tarjan_scc.find_sccs(&nodes);
+
+    let mut back_edges = self.insert_components(&mut nodes2sccs);
+
+    self.insert_prefetches(&nodes2sccs);
+
+    let mut inhibited_edges = Vec::new();
+    while let Some(edge) = back_edges.pop() {
+      inhibited_edges.push(edge);
+
+      tarjan_scc.inhibit(&inhibited_edges);
+
+      let mut nodes2sccs: HashMap<u16, u16> = tarjan_scc.find_sccs(&nodes);
+      back_edges = self.insert_components(&mut nodes2sccs);
+      back_edges.retain(|edge| !inhibited_edges.contains(edge));
+    }
+
+    let mut printer = RuleGraphPrinter::new();
+    self.accept(&mut printer).unwrap();
+    printer.dump("graph.dot").unwrap();
+
+    Ok(())
   }
-}
 
-pub trait RuleGraphVisitor {
-  fn visit_graph(&mut self, graph: &RuleGraph);
-}
-
-#[derive(PartialEq, Debug, Clone)]
-pub enum VariableAttribute {
-  Domains(Vec<Arc<BDDDomain>>),
-  Predicate(Arc<str>, usize),
-}
-
-pub fn union_of<T: Clone + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {
-  let mut union = left.to_vec();
-  for item in right {
-    if !union.contains(item) {
-      union.push(item.clone())
+  fn insert_prefetches(&mut self, nodes2sccs: &HashMap<u16, u16>) {
+    for (node_id, component_id) in nodes2sccs {
+      if let Some(node) = self.create.node(*node_id)
+        && let Some(component) = self.create.node(*component_id)
+      {
+        for dep in node.depends_on.borrow().iter().cloned() {
+          if *component_id == dep.id {
+            continue;
+          }
+          let dep_component_id = nodes2sccs.get(&dep.id);
+          if dep_component_id.is_none() {
+            let prefetch = self.create.prefetch(dep.clone());
+            component.depend_on(Some(prefetch));
+          } else if let Some(dep_component_id) = dep_component_id
+            && dep_component_id != component_id
+          {
+            let prefetch = self.create.prefetch(dep.clone());
+            component.depend_on(Some(prefetch));
+          }
+        }
+      }
     }
   }
-  union
+
+  fn insert_components(&mut self, nodes2sccs: &mut HashMap<u16, u16>) -> Vec<(Rc<Node>, u16)> {
+    let mut back_edges = Vec::new();
+    let mut components = HashMap::new();
+    let mut component_ids = HashMap::new();
+    let mut todo = VecDeque::new();
+    let mut done = HashSet::new();
+    for root in &mut self.roots {
+      let root_id = root.id;
+      todo.push_back(root.clone());
+      if let Some(component_id) = nodes2sccs.get(&root_id) {
+        if let NodeKind::Component { .. } = &root.kind {
+          components.insert(root_id, root.clone());
+          done.insert(root.id);
+        } else {
+          let NodeKind::Relation { name, attributes, .. } = &root.kind else {
+            panic!("component heads only for relations")
+          };
+          *root = self.create.component(name.clone(), attributes.clone(), root.clone());
+          components.insert(root_id, root.clone());
+          component_ids.insert(*component_id, root.id);
+          done.insert(root.id);
+        }
+      }
+    }
+    while let Some(node) = todo.pop_front() {
+      let node_id = node.id;
+      done.insert(node_id);
+      let node_component_id = if let Some(component_id) = nodes2sccs.get(&node_id) { *component_id } else { node_id };
+      for dep in &mut *node.depends_on.borrow_mut() {
+        let dep_id = dep.id;
+
+        if !done.contains(&dep_id) {
+          todo.push_back(dep.clone());
+        }
+        if let Some(component) = components.get(&dep_id) {
+          *dep = component.clone();
+          let edge = (node.clone(), dep.id);
+          if !back_edges.contains(&edge) {
+            back_edges.push(edge);
+          }
+        } else if let Some(component_id) = nodes2sccs.get(&dep_id) {
+          if *component_id != node_component_id {
+            if let NodeKind::Component { .. } = &dep.kind {
+              components.insert(dep_id, dep.clone());
+              done.insert(dep.id);
+            } else {
+              let NodeKind::Relation { name, attributes, .. } = &dep.kind else {
+                panic!("component heads only for relations")
+              };
+              *dep = self.create.component(name.clone(), attributes.clone(), dep.clone());
+              component_ids.insert(*component_id, dep.id);
+              components.insert(dep_id, dep.clone());
+              done.insert(dep.id);
+            }
+          }
+        }
+      }
+    }
+
+    for value in nodes2sccs.values_mut() {
+      if let Some(component_id) = component_ids.get(value) {
+        *value = *component_id;
+      }
+    }
+    back_edges
+  }
+
+  pub fn accept<E, V: RuleGraphVisitor<E>>(&self, visitor: &mut V) -> Result<(), E> {
+    visitor.visit_graph(self)
+  }
 }
 
-#[derive(PartialEq, Debug, Clone)]
-pub struct Variable {
-  pub name: Arc<str>,
-  attributes: Vec<VariableAttribute>,
-}
+pub fn normalize_atom(atom: &mut Atom, constraints: &mut Vec<Atom>, counter: &mut usize) {
+  let terms = match atom {
+    Atom::Pos(_, terms) | Atom::Neg(_, terms) => terms,
+    _ => return,
+  };
+  for term in terms {
+    match term {
+      term @ Term::Bool(_) | term @ Term::Ord(_) | term @ Term::Str(_) => {
+        *counter += 1;
+        let var_name: Arc<str> = Arc::from(format!("@{}", counter));
+        let var = Term::Var(var_name);
+        let val = replace(term, var.clone());
 
-impl Variable {
-  pub fn new(name: Arc<str>) -> Self {
-    Self { name, attributes: Vec::new() }
-  }
-
-  pub fn with_predicate(mut self, name: Arc<str>, arity: usize) -> Self {
-    self.attributes.push(VariableAttribute::Predicate(name, arity));
-    self
-  }
-
-  pub fn with_domains(mut self, domains: Vec<Arc<BDDDomain>>) -> Self {
-    self.attributes.push(VariableAttribute::Domains(domains));
-    self
-  }
-
-  pub fn arity(&self) -> usize {
-    let (_, arity) = self.predicate();
-    arity
-  }
-
-  pub fn predicate(&self) -> (&Arc<str>, usize) {
-    self
-      .attributes
-      .iter()
-      .find_map(|att| {
-        let VariableAttribute::Predicate(name, arity) = att else { return None };
-        Some((name, *arity))
-      })
-      .expect("expected predicate to be defined")
-  }
-
-  pub fn domains(&self) -> &[Arc<BDDDomain>] {
-    self
-      .attributes
-      .iter()
-      .find_map(|att| {
-        let VariableAttribute::Domains(domains) = att else { return None };
-        Some(domains)
-      })
-      .expect("expected domains to be defined")
-  }
-
-  pub fn domain_for(&self, binding: &str) -> Option<Arc<BDDDomain>> {
-    self
-      .attributes
-      .iter()
-      .find_map(|att| {
-        let VariableAttribute::Domains(typ) = att else { return None };
-        Some(typ)
-      })
-      .expect("expected type to be defined")
-      .into_iter()
-      .find(|domain| domain.name.as_ref() == binding)
-      .cloned()
+        constraints.push(Atom::Constraint { left: var, cmp: Cmp::EQ, right: val });
+      }
+      _ => continue,
+    }
   }
 }
 
-#[derive(Debug, Clone)]
-pub struct VariableContext {
-  relations: HashMap<String, usize>,
-  domains: HashMap<Arc<str>, usize>,
+enum ANode<'a> {
+  Fix(u16, Ref<'a, Vec<Rc<Node>>>),
+  Mod(u16, Vec<Rc<Node>>),
 }
 
-impl VariableContext {
+impl<'a> ANode<'a> {
+  pub fn depends_on<'b: 'a>(&'b self) -> &'a Vec<Rc<Node>> {
+    match self {
+      ANode::Fix(_, deps) => deps.as_ref(),
+      ANode::Mod(_, nodes) => nodes,
+    }
+  }
+
+  pub fn id(&self) -> u16 {
+    match self {
+      ANode::Fix(id, _) | ANode::Mod(id, _) => *id,
+    }
+  }
+}
+
+struct TarjanSCC {
+  index: usize,
+  stack: Vec<u16>,
+  indices: NodeAttributes<usize>,
+  low_links: NodeAttributes<usize>,
+  on_stack: HashSet<u16>,
+  overrides: HashMap<u16, Vec<Rc<Node>>>,
+  sccs: Vec<Vec<u16>>,
+}
+
+impl TarjanSCC {
   pub fn new() -> Self {
-    let relations = HashMap::new();
-    let domains = HashMap::new();
-    VariableContext { relations, domains }
+    Self {
+      index: 0,
+      stack: Vec::new(),
+      indices: NodeAttributes::new(),
+      low_links: NodeAttributes::new(),
+      on_stack: HashSet::new(),
+      overrides: HashMap::new(),
+      sccs: Vec::new(),
+    }
   }
 
-  pub fn domain_variable_for(&mut self, name: &Arc<str>) -> Arc<str> {
-    let count = self.domains.entry(name.clone()).or_insert(0);
-    *count += 1;
-    Arc::from(format!("{}{}", name, count))
+  fn inhibit(&mut self, inhibited_edges: &Vec<(Rc<Node>, u16)>) {
+    for (node, to) in inhibited_edges {
+      self.overrides.insert(node.id, node.depends_on.borrow().iter().filter(|dep| dep.id != *to).cloned().collect());
+    }
   }
 
-  pub fn relation_variable_for(&mut self, name: &str, arity: usize) -> Variable {
-    let key = name.to_string();
-    let number = self.relations.entry(key).or_insert(0);
-    *number += 1;
-    let name: Arc<str> = Arc::from(name);
-    let variable_name: Arc<str> = Arc::from(format!("{}_{}", &name, number));
-    Variable::new(variable_name).with_predicate(name, arity)
+  pub fn anode<'a>(&self, node: &'a Rc<Node>) -> ANode<'a> {
+    if let Some(depends_on) = self.overrides.get(&node.id) {
+      ANode::Mod(node.id, depends_on.clone())
+    } else {
+      ANode::Fix(node.id, node.depends_on.borrow())
+    }
   }
 
-  pub fn join_variable_for(&mut self, left: &str, right: &str, arity: usize) -> Variable {
-    let key = format!("{}\u{2a1d}{}", left, right);
-    let number = self.relations.entry(key.clone()).or_insert(0);
-    *number += 1;
-    let variable_name: Arc<str> = Arc::from(format!("{}_{}", &key, number));
-    let predicate: Arc<str> = Arc::from(key);
-    Variable::new(variable_name).with_predicate(predicate, arity)
+  pub fn find_sccs(&mut self, nodes: &Vec<Rc<Node>>) -> HashMap<u16, u16> {
+    self.index = 0;
+    self.stack.clear();
+    self.indices.clear();
+    self.low_links.clear();
+    self.on_stack.clear();
+    self.sccs.clear();
+
+    for node in nodes {
+      if !self.indices.contains(node.id) {
+        let anode = self.anode(node);
+        self.strong_connect(anode);
+      }
+    }
+    self
+      .sccs
+      .iter()
+      .filter(|group| group.len() > 1)
+      .flat_map(|group| {
+        let group_id = group[0];
+        group.iter().map(move |node_id| (*node_id, group_id))
+      })
+      .collect()
+  }
+
+  fn strong_connect(&mut self, node: ANode) {
+    let node_id = node.id();
+
+    self.init_node(node_id);
+    self.push_node(node_id);
+
+    for dep in node.depends_on() {
+      self.handle_dep(node_id, dep);
+    }
+
+    if self.low_links.get(node_id) == self.indices.get(node_id) {
+      self.build_scc(node_id);
+    }
+  }
+
+  fn init_node(&mut self, node_id: u16) {
+    self.indices.set(node_id, self.index);
+    self.low_links.set(node_id, self.index);
+    self.index += 1;
+  }
+
+  fn push_node(&mut self, node_id: u16) {
+    self.stack.push(node_id);
+    self.on_stack.insert(node_id);
+  }
+
+  fn pop_node(&mut self) -> Option<u16> {
+    let node_id = self.stack.pop()?;
+    self.on_stack.remove(&node_id);
+    Some(node_id)
+  }
+
+  fn handle_dep(&mut self, node_id: u16, dep: &Rc<Node>) {
+    let dep_id = dep.id;
+    if !self.indices.contains(dep_id) {
+      let anode = self.anode(dep);
+      self.strong_connect(anode);
+      let min_low = *self.low_links.get(node_id).unwrap().min(self.low_links.get(dep_id).unwrap());
+      self.low_links.set(node_id, min_low);
+    } else if self.on_stack.contains(&dep_id) {
+      let min_low = *self.low_links.get(node_id).unwrap().min(self.indices.get(dep_id).unwrap());
+      self.low_links.set(node_id, min_low);
+    }
+  }
+
+  fn build_scc(&mut self, node_id: u16) {
+    let mut scc = Vec::new();
+    while let Some(n_id) = self.pop_node() {
+      scc.push(n_id);
+      if n_id == node_id {
+        break;
+      }
+    }
+    self.sccs.push(scc);
+  }
+}
+pub trait RuleGraphVisitor<E> {
+  fn visit_graph(&mut self, graph: &RuleGraph) -> Result<(), E>;
+}
+
+struct RuleGraphPrinter {
+  buffer: String,
+  visited: HashSet<u16>,
+}
+
+impl RuleGraphPrinter {
+  pub fn new() -> Self {
+    RuleGraphPrinter {
+      buffer: String::new(),
+      visited: HashSet::new(),
+    }
+  }
+  pub fn dump(&self, path: &str) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "{}", self.buffer)?;
+    drop(file);
+    let png_path = path.replace(".dot", ".png");
+    Command::new("dot").arg("-Tpng").arg(path).arg("-o").arg(png_path).output()?;
+    Ok(())
   }
 }
 
-#[derive(PartialEq, Debug, Clone)]
-pub struct Location {
-  pub uri: Arc<str>,
-}
-
-impl Location {
-  pub fn from(uri: &str) -> Location {
-    let uri = Arc::from(uri);
-    Location { uri }
+impl RuleGraphVisitor<()> for RuleGraphPrinter {
+  fn visit_graph(&mut self, graph: &RuleGraph) -> Result<(), ()> {
+    self.buffer.push_str("digraph G {{");
+    for root in &graph.roots {
+      root.accept(self)?;
+    }
+    self.buffer.push_str("}}");
+    Ok(())
   }
 }
 
-pub struct BIRProg {
-  instructions: Vec<BIRInst>,
-}
+impl NodeVisitor<()> for RuleGraphPrinter {
+  fn visit_store(&mut self, id: u16, store: &Arc<str>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+    self.buffer.push_str(&format!("  {} [label=\"{}: {}\",shape=triangle];\n", id, id, store));
 
-impl BIRProg {
-  pub fn accept<E, T: BIRVisitor<E>>(&self, visitor: &mut T) -> Result<(), E> {
-    for instruction in &self.instructions {
-      instruction.accept(visitor)?;
+    for dep in depends_on {
+      self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
+      dep.accept(self)?;
     }
     Ok(())
   }
 
-  pub fn new(instructions: Vec<BIRInst>) -> Self {
-    Self { instructions }
-  }
-}
-
-#[derive(PartialEq, Debug, Clone)]
-pub enum BIRInst {
-  Load { to: Variable, from: Location },
-  Store { from: Variable, to: Location },
-  Copy { to: Variable, from: Variable },
-  Project { to: Variable, from: Variable },
-  Join { to: Variable, left: Variable, right: Variable },
-  Union { to: Variable, left: Variable, right: Variable },
-}
-
-impl BIRInst {
-  pub fn accept<E, T: BIRVisitor<E>>(&self, visitor: &mut T) -> Result<(), E> {
-    use BIRInst::*;
-    match self {
-      Load { to, from } => visitor.load(to, from),
-      Store { from, to } => visitor.store(from, to),
-      Copy { to, from } => visitor.copy(to, from),
-      Project { to, from } => visitor.project(to, from),
-      Join { to, left, right } => visitor.join(to, left, right),
-      Union { to, left, right } => visitor.union(to, left, right),
+  fn visit_source(&mut self, id: u16, store: &Arc<str>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
     }
-  }
-}
+    self.buffer.push_str(&format!("  {} [label=\"{}: {}\",shape=invtriangle];\n", id, id, store));
 
-pub struct BIRGenerator {
-  manager: BDDManagerRef,
-  domains: HashMap<Arc<str>, crate::bdd::domain::Domain>,
-  goals: Vec<Variable>,
-  instructions: Vec<BIRInst>,
-}
-
-impl BIRGenerator {
-  pub fn new(manager: BDDManagerRef) -> BIRGenerator {
-    let domains = HashMap::new();
-    let goals = Vec::new();
-    let instructions = Vec::new();
-    BIRGenerator {
-      manager,
-      domains,
-      goals,
-      instructions,
+    for dep in depends_on {
+      self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
+      dep.accept(self)?;
     }
+    Ok(())
   }
 
-  fn current_var(&self) -> Variable {
-    self.goals.last().expect("expected variable goal").clone()
+  fn visit_relation(&mut self, id: u16, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+    self.buffer.push_str(&format!("  {} [label=\"{}: {}/{}\"];\n", id, id, name, attributes.len()));
+
+    for dep in depends_on {
+      self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
+      dep.accept(self)?;
+    }
+
+    Ok(())
   }
 
-  pub fn ir(self) -> BIRProg {
-    BIRProg::new(self.instructions)
-  }
-}
+  fn visit_rule(&mut self, id: u16, head: &Atom, body: &Vec<Atom>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+    self.buffer.push_str(&format!(
+      "  {} [label=\"{}: {} <- {}\"];\n",
+      id,
+      id,
+      head,
+      body.iter().map(|a| a.to_string()).collect::<Vec<String>>().join(" & ").replace("\"", "\\\"")
+    ));
 
-impl RuleGraphVisitor for BIRGenerator {
-  fn visit_graph(&mut self, graph: &RuleGraph) {
-    self.domains = graph
-      .domains
-      .iter()
-      .map(|(_, domain)| {
-        let Domain { name, size, uri } = domain.as_ref();
-        let domain = crate::bdd::domain::Domain::new(self.manager.clone(), *size).loaded_from(uri.clone());
-        (name.clone(), domain)
-      })
-      .collect();
-    for root in &graph.roots {
-      let NodeKind::Relation { name, attributes, .. } = &root.kind else {
-        panic!("expected relation as root")
-      };
-      let mut context = VariableContext::new();
-      let domains = attributes
-        .iter()
-        .map(|domain| {
-          let domain_name = &domain.name;
-          let domain = self.domains.get_mut(domain_name).expect("domain should be defined");
-          let name = context.domain_variable_for(domain_name);
-          domain.instance(name).expect("todo")
-        })
-        .collect();
-      let variable = context.relation_variable_for(name.as_ref(), attributes.len()).with_domains(domains);
-      self.goals.push(variable);
-      root.accept(self);
-      self.goals.pop();
+    for dep in depends_on {
+      self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
+      dep.accept(self)?;
     }
-  }
-}
-
-impl NodeVisitor for BIRGenerator {
-  fn visit_relation(&mut self, _name: &Arc<str>, _attributes: &Vec<Arc<Domain>>, store: &Store, depends_on: &Vec<Arc<Node>>) {
-    let variable = self.current_var();
-    if let Store::From(uri) = store {
-      let uri = Location::from(uri.as_ref());
-      self.instructions.push(BIRInst::Load { to: variable.clone(), from: uri });
-    }
-    let mut context = VariableContext::new();
-    let mut next_var = variable.clone();
-    for node in depends_on {
-      self.goals.push(next_var);
-      node.accept(self);
-      let result_var = self.goals.pop().unwrap();
-      if result_var != variable {
-        self.instructions.push(BIRInst::Union {
-          to: variable.clone(),
-          left: variable.clone(),
-          right: result_var,
-        });
-      }
-      next_var = context.relation_variable_for(variable.name.as_ref(), variable.arity()).with_domains(variable.domains().to_vec());
-    }
-    if let Store::To(uri) = store {
-      let uri = Location::from(uri.as_ref());
-      self.instructions.push(BIRInst::Store { from: variable.clone(), to: uri });
-    }
+    Ok(())
   }
 
-  fn visit_rule(&mut self, head: &Atom, body: &Vec<Atom>, depends_on: &Vec<Arc<Node>>) {
-    let mut context = VariableContext::new();
-    let variable = self.current_var();
-
-    let mut bindings = HashMap::new();
-    for (term, binding) in head
-      .terms
-      .iter()
-      .zip(variable.domains().iter())
-      .filter_map(|(term, domain)| if let Term::Var(variable) = term { Some((variable.clone(), domain.name.clone())) } else { None })
-    {
-      bindings.insert(term, binding);
+  fn visit_component(&mut self, id: u16, _name: &Arc<str>, _attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
     }
 
-    let sub_goals = body
-      .iter()
-      .map(|atom| {
-        let (p_name, p_arity) = &atom.predicate();
-        let node = depends_on
-          .iter()
-          .find(|node| {
-            let NodeKind::Relation { name, attributes, .. } = &node.kind else {
-              return false;
-            };
-            name == p_name && attributes.len() == *p_arity
-          })
-          .expect("expected atom matching relation");
-        (atom, node)
-      })
-      .collect::<Vec<_>>();
-    let mut variables: HashMap<(Arc<str>, usize), Variable> = HashMap::new();
-    let mut join = Vec::new();
-    for (atom, node) in sub_goals {
-      let predicate = atom.predicate();
-      let NodeKind::Relation { name, attributes, .. } = &node.kind else {
-        panic!("expected relation as node")
-      };
-      let mut domains = Vec::new();
-      for (i, term) in atom.terms.iter().enumerate() {
-        let domain_name = &attributes[i].name;
-        let base_domain = self.domains.get_mut(domain_name).expect("domain should be defined");
-        if let Term::Var(variable) = term {
-          if let Some(name) = bindings.get(variable) {
-            domains.push(base_domain.instance(name.clone()).expect("todo"));
-          } else {
-            let name = context.domain_variable_for(name);
-            bindings.insert(variable.clone(), name.clone());
-            domains.push(base_domain.instance(name.clone()).expect("todo"));
-          }
-        } else {
-          let name = context.domain_variable_for(name);
-          domains.push(base_domain.instance(name.clone()).expect("todo"));
-        }
-      }
-
-      let new_variable = context.relation_variable_for(name.as_ref(), attributes.len()).with_domains(domains);
-      if let Some(variable) = variables.get(&predicate) {
-        self.instructions.push(BIRInst::Copy {
-          to: new_variable.clone(),
-          from: variable.clone(),
-        });
+    for dep in depends_on {
+      if let NodeKind::Prefetch = dep.kind {
+        self.buffer.push_str(&format!("  {} -> {}  [style=dashed];\n", id, dep.id));
       } else {
-        self.goals.push(new_variable.clone());
-        node.accept(self);
-        let variable = self.goals.pop().expect("expected variable to remain on stack");
-        variables.insert(predicate, variable);
+        self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
       }
-      join.push(new_variable);
+      dep.accept(self)?;
     }
-    let (join_instructions, result) = join.into_iter().fold((Vec::new(), None::<Variable>), |(mut instructions, left), right| {
-      if let Some(left) = left {
-        let domains = union_of(left.domains(), right.domains());
-        let arity = domains.len();
-        let (left_name, _) = left.predicate();
-        let (right_name, _) = right.predicate();
-        let result = context.join_variable_for(left_name.as_ref(), right_name.as_ref(), arity).with_domains(domains);
-        instructions.push(BIRInst::Join { to: result.clone(), left, right });
-        (instructions, Some(result))
-      } else {
-        (instructions, Some(right))
-      }
-    });
-    self.instructions.extend(join_instructions);
-    if let Some(result) = result {
-      self.instructions.push(BIRInst::Project { to: variable, from: result });
-    }
+    Ok(())
   }
-}
 
-pub trait BIRVisitor<E> {
-  fn load(&mut self, to: &Variable, from: &Location) -> Result<(), E>;
-  fn store(&mut self, from: &Variable, to: &Location) -> Result<(), E>;
-  fn copy(&mut self, to: &Variable, from: &Variable) -> Result<(), E>;
-  fn project(&mut self, to: &Variable, from: &Variable) -> Result<(), E>;
-  fn join(&mut self, to: &Variable, left: &Variable, right: &Variable) -> Result<(), E>;
-  fn union(&mut self, to: &Variable, left: &Variable, right: &Variable) -> Result<(), E>;
+  fn visit_prefetch(&mut self, id: u16, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+
+    for dep in depends_on {
+      self.buffer.push_str(&format!("  {} -> {} [style=dashed];\n", id, dep.id));
+      dep.accept(self)?;
+    }
+    Ok(())
+  }
 }
 
 #[cfg(test)]
 mod test {
 
   use super::*;
+  use crate::expect;
+  use crate::testutil::core::{Locatable, expect};
+  use crate::testutil::matchers::Matcher;
+  use crate::testutil::matchers::contains::Contains;
+  use crate::testutil::matchers::empty::Empty;
+  use crate::testutil::matchers::equal_to::EqualTo;
 
   mod rule_graph {
     use super::*;
@@ -709,8 +1002,8 @@ mod test {
 
         let mut relations = vec![ast::relation("goal", vec!["domain"]).stored_to("out")];
         let goals = graph.fetch_goals(&mut relations).unwrap();
-        assert_eq!(goals, vec![relation_node(name("goal"), vec![local_domain(name("domain"), 2, name("out"))], Store::To(name("out")))]);
-        assert_eq!(relations.len(), 0);
+        expect!(goals).to_contain(vec![store("out", relation("goal", vec![("domain", 2, "out")]))]);
+        expect!(relations.len()).to_equal(0);
       }
 
       #[test]
@@ -722,14 +1015,11 @@ mod test {
 
         let mut relations = vec![ast::relation("goal1", vec!["domain"]).stored_to("out1"), ast::relation("goal2", vec!["domain"]).stored_to("out2")];
         let goals = graph.fetch_goals(&mut relations).unwrap();
-        assert_eq!(
-          goals,
-          vec![
-            relation_node(name("goal1"), vec![local_domain(name("domain"), 2, name("out"))], Store::To(name("out1"))),
-            relation_node(name("goal2"), vec![local_domain(name("domain"), 2, name("out"))], Store::To(name("out2")))
-          ]
-        );
-        assert_eq!(relations.len(), 0);
+        expect!(goals).to_contain(vec![
+          store("out1", relation("goal1", vec![("domain", 2, "out")])),
+          store("out2", relation("goal2", vec![("domain", 2, "out")])),
+        ]);
+        expect!(relations.len()).to_equal(0);
       }
 
       #[test]
@@ -745,8 +1035,8 @@ mod test {
           ast::relation("goal3", vec!["domain"]),
         ];
         let goals = graph.fetch_goals(&mut relations).unwrap();
-        assert_eq!(goals, vec![relation_node(name("goal1"), vec![local_domain(name("domain"), 2, name("out"))], Store::To(name("out")))]);
-        assert_eq!(relations.len(), 2);
+        expect!(goals).to_contain(vec![store("out", relation("goal1", vec![("domain", 2, "out")]))]);
+        expect!(relations.len()).to_equal(2);
       }
     }
 
@@ -763,8 +1053,8 @@ mod test {
         let mut relations = vec![ast::relation("rel", vec!["domain"])];
         let body = vec![(name("rel"), 1)];
         let nodes = graph.fetch_relations(&body, &mut relations).unwrap();
-        assert_eq!(nodes, vec![relation_node(name("rel"), vec![local_domain(name("domain"), 2, name("out"))], Store::Mem)]);
-        assert_eq!(relations.len(), 0);
+        expect!(nodes).to_contain(vec![relation("rel", vec![("domain", 2, "out")])]);
+        expect!(relations.len()).to_equal(0);
       }
 
       #[test]
@@ -777,8 +1067,8 @@ mod test {
         let mut relations = vec![ast::relation("rel", vec!["domain"]).loaded_from("in")];
         let body = vec![(name("rel"), 1)];
         let nodes = graph.fetch_relations(&body, &mut relations).unwrap();
-        assert_eq!(nodes, vec![relation_node(name("rel"), vec![local_domain(name("domain"), 2, name("out"))], Store::From(name("in")))]);
-        assert_eq!(relations.len(), 0);
+        expect!(nodes).to_contain(vec![relation("rel", vec![("domain", 2, "out")])]);
+        expect!(relations.len()).to_equal(0);
       }
 
       #[test]
@@ -791,8 +1081,8 @@ mod test {
         let mut relations = vec![ast::relation("rel", vec!["domain"]).stored_to("out")];
         let body = vec![(name("rel"), 1)];
         let nodes = graph.fetch_relations(&body, &mut relations).unwrap();
-        assert_eq!(nodes, vec![relation_node(name("rel"), vec![local_domain(name("domain"), 2, name("out"))], Store::To(name("out")))]);
-        assert_eq!(relations.len(), 0);
+        expect!(nodes).to_contain(vec![relation("rel", vec![("domain", 2, "out")])]);
+        expect!(relations.len()).to_equal(0);
       }
 
       #[test]
@@ -805,13 +1095,13 @@ mod test {
         let mut relations = vec![ast::relation("rel1", vec!["domain"]), ast::relation("rel2", vec!["domain"])];
         let body = vec![(name("rel1"), 1)];
         let nodes = graph.fetch_relations(&body, &mut relations).unwrap();
-        assert_eq!(nodes, vec![relation_node(name("rel1"), vec![local_domain(name("domain"), 2, name("out"))], Store::Mem,)]);
-        assert_eq!(relations.len(), 1);
+        expect!(nodes).to_contain(vec![relation("rel1", vec![("domain", 2, "out")])]);
+        expect!(relations.len()).to_equal(1);
 
         let body = vec![(name("rel2"), 1)];
         let nodes = graph.fetch_relations(&body, &mut relations).unwrap();
-        assert_eq!(nodes, vec![relation_node(name("rel2"), vec![local_domain(name("domain"), 2, name("out"))], Store::Mem)]);
-        assert_eq!(relations.len(), 0);
+        expect!(nodes).to_contain(vec![relation("rel2", vec![("domain", 2, "out")])]);
+        expect!(relations.len()).to_equal(0);
       }
     }
 
@@ -828,7 +1118,7 @@ mod test {
         let body = vec![(name("rel"), 1)];
 
         let nodes = graph.fetch_known_relations(&body);
-        assert_eq!(nodes, vec![]);
+        expect!(nodes).to_be_empty();
       }
 
       #[test]
@@ -843,7 +1133,7 @@ mod test {
         graph.fetch_relations(&body, &mut relations).unwrap();
 
         let nodes = graph.fetch_known_relations(&body);
-        assert_eq!(nodes, vec![relation_node(name("rel"), vec![local_domain(name("domain"), 2, name("out"))], Store::Mem)]);
+        expect!(nodes).to_contain(vec![relation("rel", vec![("domain", 2, "out")])]);
       }
 
       #[test]
@@ -858,13 +1148,7 @@ mod test {
         graph.fetch_relations(&body, &mut relations).unwrap();
 
         let nodes = graph.fetch_known_relations(&body);
-        assert_eq!(
-          nodes,
-          vec![
-            relation_node(name("rel1"), vec![local_domain(name("domain"), 2, name("out"))], Store::Mem),
-            relation_node(name("rel2"), vec![local_domain(name("domain"), 2, name("out"))], Store::Mem)
-          ]
-        );
+        expect!(nodes).to_contain(vec![relation("rel1", vec![("domain", 2, "out")]), relation("rel2", vec![("domain", 2, "out")])]);
       }
     }
     mod fetch_rules {
@@ -884,10 +1168,10 @@ mod test {
         let mut rules = vec![ast::Rule { head, body }];
 
         let nodes = graph.fetch_rules(&pred1, &mut rules).unwrap();
-        let head = Atom::new(name("rel1"), vec![Term::Var(name("X"))]);
-        let body = vec![Atom::new(name("rel2"), vec![Term::Var(name("X"))])];
-        assert_eq!(nodes, vec![rule_node(head, body)]);
-        assert_eq!(rules.len(), 0);
+        let head = Atom::Pos(name("rel1"), vec![Term::Var(name("X"))]);
+        let body = vec![Atom::Pos(name("rel2"), vec![Term::Var(name("X"))])];
+        expect!(nodes).to_contain(vec![rule(head, body)]);
+        expect!(rules.len()).to_equal(0);
       }
 
       #[test]
@@ -909,20 +1193,21 @@ mod test {
         let mut rules = vec![rule1, rule2];
 
         let nodes = graph.fetch_rules(&pred1, &mut rules).unwrap();
-        let head = Atom::new(name("rel1"), vec![Term::Var(name("X"))]);
-        let body = vec![Atom::new(name("rel2"), vec![Term::Var(name("X"))])];
-        assert_eq!(nodes, vec![rule_node(head, body)]);
-        assert_eq!(rules.len(), 1);
+        let head = Atom::Pos(name("rel1"), vec![Term::Var(name("X"))]);
+        let body = vec![Atom::Pos(name("rel2"), vec![Term::Var(name("X"))])];
+        expect!(nodes).to_contain(vec![rule(head, body)]);
+        expect!(rules.len()).to_equal(1);
 
         let nodes = graph.fetch_rules(&pred2, &mut rules).unwrap();
-        let head = Atom::new(name("rel2"), vec![Term::Var(name("X"))]);
-        let body = vec![Atom::new(name("rel3"), vec![Term::Var(name("X"))])];
-        assert_eq!(nodes, vec![rule_node(head, body)]);
-        assert_eq!(rules.len(), 0);
+        let head = Atom::Pos(name("rel2"), vec![Term::Var(name("X"))]);
+        let body = vec![Atom::Pos(name("rel3"), vec![Term::Var(name("X"))])];
+        expect!(nodes).to_contain(vec![rule(head, body)]);
+        expect!(rules.len()).to_equal(0);
       }
     }
 
     mod fetch_known_rules {
+
       use super::*;
 
       #[test]
@@ -935,7 +1220,7 @@ mod test {
         let pred1 = pred("rel1", 1);
 
         let nodes = graph.fetch_known_rules(&pred1);
-        assert_eq!(nodes, vec![]);
+        expect!(nodes).to_be_empty();
       }
 
       #[test]
@@ -954,9 +1239,9 @@ mod test {
         graph.fetch_known_rules(&pred1);
 
         let nodes = graph.fetch_rules(&pred1, &mut rules).unwrap();
-        let head = Atom::new(name("rel1"), vec![Term::Var(name("X"))]);
-        let body = vec![Atom::new(name("rel2"), vec![Term::Var(name("X"))])];
-        assert_eq!(nodes, vec![rule_node(head, body)]);
+        let head = Atom::Pos(name("rel1"), vec![Term::Var(name("X"))]);
+        let body = vec![Atom::Pos(name("rel2"), vec![Term::Var(name("X"))])];
+        expect!(nodes).to_contain(vec![rule(head, body)]);
       }
 
       #[test]
@@ -979,13 +1264,77 @@ mod test {
         graph.fetch_rules(&pred1, &mut rules).unwrap();
 
         let nodes = graph.fetch_known_rules(&pred1);
-        let head1 = Atom::new(name("rel1"), vec![Term::Var(name("X"))]);
-        let body1 = vec![Atom::new(name("rel2"), vec![Term::Var(name("X"))])];
-        let head2 = Atom::new(name("rel1"), vec![Term::Var(name("X"))]);
-        let body2 = vec![Atom::new(name("rel3"), vec![Term::Var(name("X"))])];
-        assert_eq!(nodes, vec![rule_node(head1, body1), rule_node(head2, body2)]);
+        let head1 = Atom::Pos(name("rel1"), vec![Term::Var(name("X"))]);
+        let body1 = vec![Atom::Pos(name("rel2"), vec![Term::Var(name("X"))])];
+        let head2 = Atom::Pos(name("rel1"), vec![Term::Var(name("X"))]);
+        let body2 = vec![Atom::Pos(name("rel3"), vec![Term::Var(name("X"))])];
+        expect!(nodes).to_contain(vec![rule(head1, body1), rule(head2, body2)]);
       }
     }
+  }
+
+  #[derive(Debug)]
+  struct StoreMatcher {
+    uri: &'static str,
+    relation: RelationMatcher,
+  }
+
+  impl Matcher<Rc<Node>> for StoreMatcher {
+    fn matches(&self, actual: &Rc<Node>) -> bool {
+      match &actual.kind {
+        NodeKind::Store(store) => store.as_ref() == self.uri && self.relation.matches(actual.depends_on.borrow().first().unwrap()),
+        _ => false,
+      }
+    }
+  }
+
+  fn store(uri: &'static str, relation: RelationMatcher) -> StoreMatcher {
+    StoreMatcher { uri, relation }
+  }
+
+  #[derive(Debug)]
+  struct RelationMatcher {
+    name: &'static str,
+    attributes: Vec<(&'static str, u128, &'static str)>,
+  }
+
+  impl Matcher<Rc<Node>> for RelationMatcher {
+    fn matches(&self, actual: &Rc<Node>) -> bool {
+      match &actual.kind {
+        NodeKind::Relation { name, attributes } => {
+          name.as_ref() == self.name
+            && attributes
+              .iter()
+              .zip(&self.attributes)
+              .all(|(a, (name, size, uri))| a.name.as_ref() == *name && a.size == *size && a.uri.as_ref() == *uri)
+        }
+
+        _ => false,
+      }
+    }
+  }
+
+  fn relation(name: &'static str, attributes: Vec<(&'static str, u128, &'static str)>) -> RelationMatcher {
+    RelationMatcher { name, attributes }
+  }
+
+  #[derive(Debug)]
+  struct RuleMatcher {
+    head: Atom,
+    body: Vec<Atom>,
+  }
+
+  impl Matcher<Rc<Node>> for RuleMatcher {
+    fn matches(&self, actual: &Rc<Node>) -> bool {
+      match &actual.kind {
+        NodeKind::Rule { head, body } => head == &self.head && body == &self.body,
+        _ => false,
+      }
+    }
+  }
+
+  fn rule(head: Atom, body: Vec<Atom>) -> RuleMatcher {
+    RuleMatcher { head, body }
   }
 
   fn pred<T: AsRef<str>>(name: T, arity: usize) -> (Arc<str>, usize) {

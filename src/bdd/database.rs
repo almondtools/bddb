@@ -28,8 +28,8 @@ impl BDDBManager {
     self.count_cache.get_or_insert_default()
   }
 
-  pub fn domain(&self, size: u128) -> Domain {
-    Domain::new(self.manager.clone(), size)
+  pub fn domain(&self, name: Arc<str>, size: u128) -> Domain {
+    Domain::new(self.manager.clone(), name, size)
   }
 
   pub fn relation(&self, name: impl Into<Arc<str>>, domains: Vec<Arc<BDDDomain>>) -> BDDRelationDef {

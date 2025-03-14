@@ -5,3 +5,4 @@ lalrpop_mod!(pub datalogparser,"/lang/datalogparser.rs");
 pub mod ast;
 pub mod source;
 pub mod graph;
+pub mod ir;

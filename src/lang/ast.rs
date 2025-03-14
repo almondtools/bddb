@@ -475,6 +475,17 @@ impl Relation {
   pub fn is_stored(&self) -> bool {
     self.store().is_some()
   }
+
+  pub fn source(&self) -> Option<Rc<str>> {
+    match self {
+      Relation::From(_, store) => Some(store.clone()),
+      _ => None,
+    }
+  }
+
+  pub fn is_loaded(&self) -> bool {
+    self.source().is_some()
+  }
 }
 
 impl Into<RelationSignature> for Relation {

@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fmt::Display;
 use std::iter::FromIterator;
 use std::ops::Deref;
@@ -106,31 +105,6 @@ impl<T: PartialEq> Deref for VecSet<T> {
 
   fn deref(&self) -> &[T] {
     &self.items
-  }
-}
-
-pub struct WorkSet<T> {
-  items: VecDeque<T>,
-}
-impl<T: PartialEq> WorkSet<T> {
-  pub fn remove(&mut self) -> Option<T> {
-    self.items.pop_front()
-  }
-
-  pub fn append(&mut self, item: T) {
-    if !self.items.contains(&item) {
-      self.items.push_back(item);
-    }
-  }
-}
-
-impl<T> From<VecDeque<T>> for WorkSet<T>
-where
-  T: Clone,
-{
-  fn from(value: VecDeque<T>) -> Self {
-    let items = value;
-    WorkSet { items }
   }
 }
 

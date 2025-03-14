@@ -1,3 +1,5 @@
+*.dot
+*.png
 /target
 **/*.rs.bk
 /.vscode
