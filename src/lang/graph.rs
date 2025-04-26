@@ -272,6 +272,7 @@ impl Node {
       NodeKind::Rule { head, body } => visitor.visit_rule(id, head, body, self.depends_on.borrow().as_ref()),
       NodeKind::Component { name, attributes } => visitor.visit_component(id, name, attributes, self.depends_on.borrow().as_ref()),
       NodeKind::Prefetch => visitor.visit_prefetch(id, self.depends_on.borrow().as_ref()),
+      NodeKind::Init { name, attributes } => visitor.visit_init(id, name, attributes, self.depends_on.borrow().as_ref()),
     }
   }
 }
@@ -296,6 +297,22 @@ pub enum NodeKind {
   Rule { head: Atom, body: Vec<Atom> },
   Component { name: Arc<str>, attributes: Vec<Arc<Domain>> },
   Prefetch,
+  Init { name: Arc<str>, attributes: Vec<Arc<Domain>> },
+}
+impl NodeKind {
+  pub fn is_component_root(&self) -> bool {
+    match self {
+      NodeKind::Component { .. } => true,
+      _ => false,
+    }
+  }
+
+  pub fn is_component_exit(&self) -> bool {
+    match self {
+      NodeKind::Prefetch | NodeKind::Init { .. } => true,
+      _ => false,
+    }
+  }
 }
 
 pub struct NodeFactory {
@@ -340,6 +357,10 @@ impl NodeFactory {
     prefetch
   }
 
+  pub fn init(&mut self, name: Arc<str>, attributes: Vec<Arc<Domain>>) -> Rc<Node> {
+    self.next_node(NodeKind::Init { name, attributes })
+  }
+
   fn next_node(&mut self, kind: NodeKind) -> Rc<Node> {
     let id = self.id.update(|id| id + 1);
     let node = Rc::new(Node::new(id, kind));
@@ -355,6 +376,7 @@ pub trait NodeVisitor<E> {
   fn visit_rule(&mut self, id: u16, head: &Atom, body: &Vec<Atom>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
   fn visit_component(&mut self, id: u16, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
   fn visit_prefetch(&mut self, id: u16, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
+  fn visit_init(&mut self, id: u16, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), E>;
 }
 
 pub struct RuleGraph {
@@ -601,20 +623,32 @@ impl RuleGraph {
       if let Some(node) = self.create.node(*node_id)
         && let Some(component) = self.create.node(*component_id)
       {
+        let mut prefetches = Vec::new();
+        let mut inits = HashMap::new();
         for dep in node.depends_on.borrow().iter().cloned() {
           if *component_id == dep.id {
             continue;
           }
           let dep_component_id = nodes2sccs.get(&dep.id);
-          if dep_component_id.is_none() {
-            let prefetch = self.create.prefetch(dep.clone());
-            component.depend_on(Some(prefetch));
-          } else if let Some(dep_component_id) = dep_component_id
-            && dep_component_id != component_id
-          {
-            let prefetch = self.create.prefetch(dep.clone());
-            component.depend_on(Some(prefetch));
+          if dep_component_id.map_or(true, |dep_component_id: &u16| dep_component_id != component_id) {
+            if let NodeKind::Relation { name, attributes } = &node.kind {
+              let init = self.create.init(name.clone(), attributes.clone());
+              inits.entry(*node_id).or_insert_with(|| init.clone()).depend_on(Some(dep.clone()));
+            } else {
+              let prefetch = self.create.prefetch(dep.clone());
+              prefetches.push(prefetch);
+            }
           }
+        }
+        for prefetch in prefetches {
+          component.depend_on(Some(prefetch));
+        }
+        for (_, init) in inits {
+          component.depend_on(Some(init.clone()));
+
+          let deps = init.depends_on.borrow().iter().map(|dep| dep.id).collect::<Vec<_>>();
+          node.depends_on.borrow_mut().retain(|dep| !deps.contains(&dep.id));
+          node.depend_on(Some(init));
         }
       }
     }
@@ -953,7 +987,7 @@ impl NodeVisitor<()> for RuleGraphPrinter {
     }
 
     for dep in depends_on {
-      if let NodeKind::Prefetch = dep.kind {
+      if dep.kind.is_component_exit() {
         self.buffer.push_str(&format!("  {} -> {}  [style=dashed];\n", id, dep.id));
       } else {
         self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
@@ -968,10 +1002,26 @@ impl NodeVisitor<()> for RuleGraphPrinter {
       return Ok(());
     }
 
+    self.buffer.push_str(&format!("  {} [label=\"{}: prefetch\"];\n", id, id));
+
     for dep in depends_on {
       self.buffer.push_str(&format!("  {} -> {} [style=dashed];\n", id, dep.id));
       dep.accept(self)?;
     }
+    Ok(())
+  }
+
+  fn visit_init(&mut self, id: u16, name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+    self.buffer.push_str(&format!("  {} [label=\"{}: init {}/{}\"];\n", id, id, name, attributes.len()));
+
+    for dep in depends_on {
+      self.buffer.push_str(&format!("  {} -> {};\n", id, dep.id));
+      dep.accept(self)?;
+    }
+
     Ok(())
   }
 }

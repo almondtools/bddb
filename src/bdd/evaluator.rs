@@ -120,15 +120,8 @@ impl BIRVisitor<OutOfMemory> for BIRInterpreter<'_> {
     Ok(())
   }
 
-  fn empty(&mut self, to: &Variable) -> AllocResult<()> {
-    let name = to.name.clone();
-
-    let domains = to.domains().to_vec();
-
-    let relation = self.manager.relation(name.clone(), domains).init_empty()?;
-
-    self.variables.insert(name, relation);
-    Ok(())
+  fn phi(&mut self, to: &Variable, left: &Variable, right: &Variable) -> AllocResult<()> {
+    todo!()
   }
 
   fn load(&mut self, to: &Variable, from: &Location) -> AllocResult<()> {
@@ -265,8 +258,8 @@ impl BIRVisitor<()> for BIRPrinter {
     Ok(())
   }
 
-  fn empty(&mut self, to: &Variable) -> Result<(), ()> {
-    println!("EMPTY {} [{}]", &to.name, domains(to));
+  fn phi(&mut self, to: &Variable, left: &Variable, right: &Variable) -> Result<(), ()> {
+    println!("PHI {} [{}] <- {} [{}] | {} [{}]", &to.name, domains(to), &left.name, domains(left), &right.name, domains(right));
     Ok(())
   }
 

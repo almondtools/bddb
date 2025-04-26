@@ -9,6 +9,7 @@ use oxidd::bdd::BDDManagerRef;
 use oxidd::util::OutOfMemory;
 
 use crate::bdd::domain::BDDDomain;
+use crate::util::compiler::ExactlyOnce;
 
 use super::graph::{Atom, Cmp, Domain, Node, NodeAttributes, NodeKind, NodeVisitor, RuleGraph, RuleGraphVisitor, Term, Value};
 
@@ -208,7 +209,7 @@ impl BIRProg {
 #[derive(PartialEq, Debug, Clone)]
 pub enum BIRInst {
   Iter { current: Variable, next: Variable, body: Vec<BIRInst> },
-  Empty { to: Variable },
+  Phi { to: Variable, left: Variable, right: Variable },
   Load { to: Variable, from: Location },
   Store { from: Variable, to: Location },
   Copy { to: Variable, from: Variable },
@@ -223,7 +224,7 @@ impl BIRInst {
     use BIRInst::*;
     match self {
       Iter { current, next, body } => visitor.iter(current, next, body),
-      Empty { to } => visitor.empty(to),
+      Phi { to, left, right } => visitor.phi(to, left, right),
       Load { to, from } => visitor.load(to, from),
       Store { from, to } => visitor.store(from, to),
       Copy { to, from } => visitor.copy(to, from),
@@ -407,21 +408,33 @@ impl NodeVisitor<()> for TypeAnalyzer {
       .primary
       .clone();
 
-    let roots = depends_on
+    let root = depends_on
       .iter()
       .cloned()
-      .filter(|node| if let NodeKind::Prefetch = node.kind { false } else { true })
-      .collect::<Vec<_>>();
-    if roots.len() != 1 {
-      panic!("semantic analysis failure: component must have exactly one dependency equal to the component root");
-    }
-    let root = roots[0].clone();
+      .filter(|node| if let NodeKind::Relation { .. } = node.kind { true } else { false })
+      .collect::<ExactlyOnce<_>>()
+      .expect("semantic analysis failure: component must have exactly one component root");
 
     root.accept(self)?;
 
     self
       .types
       .entry(root.id)
+      .and_modify(|bindings| bindings.require(rel_type.clone()))
+      .or_insert_with(|| TypeBindings::new(rel_type.clone()));
+
+    let init = depends_on
+      .iter()
+      .cloned()
+      .filter(|node| if let NodeKind::Init { .. } = node.kind { true } else { false })
+      .collect::<ExactlyOnce<_>>()
+      .expect("semantic analysis failure: component must have exactly one init node");
+
+    init.accept(self)?;
+
+    self
+      .types
+      .entry(init.id)
       .and_modify(|bindings| bindings.require(rel_type.clone()))
       .or_insert_with(|| TypeBindings::new(rel_type.clone()));
 
@@ -434,6 +447,31 @@ impl NodeVisitor<()> for TypeAnalyzer {
     }
 
     for dep in depends_on {
+      dep.accept(self)?;
+    }
+    Ok(())
+  }
+
+  fn visit_init(&mut self, id: u16, _name: &Arc<str>, attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), ()> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+    let rel_type = self
+      .types
+      .entry(id)
+      .or_insert_with(|| {
+        let domain_types = attributes.iter().map(|domain| self.domains.new_type_for(domain.name.clone())).collect();
+        TypeBindings::new(RelationType(domain_types))
+      })
+      .primary
+      .clone();
+
+    for dep in depends_on {
+      self
+        .types
+        .entry(dep.id)
+        .and_modify(|bindings| bindings.require(rel_type.clone()))
+        .or_insert_with(|| TypeBindings::new(rel_type.clone()));
       dep.accept(self)?;
     }
     Ok(())
@@ -494,10 +532,11 @@ impl NodeVisitor<OutOfMemory> for BIRGenerator {
       return Ok(());
     }
 
-    if depends_on.len() != 1 {
-      panic!("semantic analysis failure: store must have exactly one dependency equal to the relation to be stored");
-    }
-    let relation = depends_on[0].clone();
+    let relation = depends_on
+      .iter()
+      .cloned()
+      .collect::<ExactlyOnce<_>>()
+      .expect("semantic analysis failure: store must have exactly one dependency equal to the relation to be stored");
     relation.accept(self)?;
 
     let var = self
@@ -827,7 +866,21 @@ impl NodeVisitor<OutOfMemory> for BIRGenerator {
       vars2.push(var2);
     }
 
-    let (deps, roots) = depends_on.iter().cloned().partition::<Vec<_>, _>(|node| if let NodeKind::Prefetch = node.kind { true } else { false });
+    let (roots, inits, deps) = depends_on.iter().cloned().fold(
+      (ExactlyOnce::<Rc<Node>>::None, ExactlyOnce::<Rc<Node>>::None, Vec::<Rc<Node>>::new()),
+      |(root, init, mut deps), node| match node.kind {
+        NodeKind::Relation { .. } => (root.accept(node), init, deps),
+        NodeKind::Init { .. } => (root, init.accept(node), deps),
+        _ => {
+          deps.push(node);
+          (root, init, deps)
+        }
+      },
+    );
+    let root = roots.expect("semantic analysis failure: component must have exactly one component root");
+    let init = inits.expect("semantic analysis failure: component must have exactly one init node");
+
+    init.accept(self)?;
 
     for dep in deps {
       dep.accept(self)?;
@@ -836,31 +889,29 @@ impl NodeVisitor<OutOfMemory> for BIRGenerator {
     let component_instructions = Vec::new();
     let outer_instructions = replace(&mut self.instructions, component_instructions);
 
-    if roots.len() != 1 {
-      panic!("semantic analysis failure: component must have exactly one dependency equal to the component root");
-    }
-    let root = roots[0].clone();
-
     root.accept(self)?;
     let result_var = self
       .variables
       .require(root.id, &primary_type)
+      .expect(&format!("ir generation failure: missing variable for {}", root.id));
+    let init_var = self
+      .variables
+      .require(init.id, &primary_type)
       .expect(&format!("ir generation failure: missing variable for {}", root.id));
 
     let inner_component_instructions = replace(&mut self.instructions, outer_instructions);
 
     let mut component_instructions = Vec::new();
 
-    component_instructions.push(BIRInst::Copy {
+    component_instructions.push(BIRInst::Phi {
       to: var.clone(),
-      from: result_var.clone(),
+      left: result_var.clone(),
+      right: init_var.clone(),
     });
     for var2 in vars2 {
       component_instructions.push(BIRInst::Copy { to: var2.clone(), from: var.clone() });
     }
     component_instructions.extend(inner_component_instructions);
-
-    self.instructions.push(BIRInst::Empty { to: result_var.clone() });
 
     self.instructions.push(BIRInst::Iter {
       current: var.clone(),
@@ -878,6 +929,95 @@ impl NodeVisitor<OutOfMemory> for BIRGenerator {
 
     for dep in depends_on {
       dep.accept(self)?;
+    }
+    Ok(())
+  }
+
+  fn visit_init(&mut self, id: u16, name: &Arc<str>, _attributes: &Vec<Arc<Domain>>, depends_on: &Vec<Rc<Node>>) -> Result<(), OutOfMemory> {
+    if !self.visited.insert(id) {
+      return Ok(());
+    }
+    let TypeBindings {
+      primary: primary_type,
+      secondary: secondary_types,
+      ..
+    } = self.types.get(id).expect(&format!("type analysis failure: missing type for node {}", id));
+    let primary_type = primary_type.clone();
+    let secondary_types = secondary_types.clone();
+
+    let var = self
+      .variables
+      .primary(id)
+      .or_new(name, || {
+        let domains = primary_type
+          .domains()
+          .iter()
+          .map(|DomainType(name, id)| {
+            Ok(
+              self
+                .domains
+                .get_mut(name)
+                .map(|base| base.instance(*id))
+                .expect(&format!("type analysis failure: missing domain {}", name))?,
+            )
+          })
+          .try_collect::<Vec<_>>()?;
+        Ok(domains)
+      })?
+      .clone();
+
+    let mut acc_var: Option<Variable> = None;
+    for node in depends_on {
+      node.accept(self)?;
+      let result_var = self
+        .variables
+        .require(node.id, &primary_type)
+        .expect(&format!("ir generation failure: missing variable for {}", node.id))
+        .clone();
+      let union_domains = var.domains.clone();
+      let new_acc_var = self.variables.temp(name, union_domains);
+      if let Some(acc_var) = acc_var {
+        self.instructions.push(BIRInst::Union {
+          to: new_acc_var.clone(),
+          left: acc_var,
+          right: result_var,
+        });
+      } else {
+        self.instructions.push(BIRInst::Copy {
+          to: new_acc_var.clone(),
+          from: result_var,
+        });
+      }
+      acc_var = Some(new_acc_var);
+    }
+    if let Some(acc_var) = acc_var {
+      self.instructions.push(BIRInst::Copy {
+        to: var.clone(),
+        from: acc_var.clone(),
+      });
+    }
+    for secondary_type in &secondary_types {
+      let var2 = self
+        .variables
+        .add(
+          id,
+          name,
+          secondary_type
+            .domains()
+            .iter()
+            .map(|DomainType(name, id)| {
+              Ok(
+                self
+                  .domains
+                  .get_mut(name)
+                  .map(|base| base.instance(*id))
+                  .expect(&format!("type analysis failure: missing domain {}", name))?,
+              )
+            })
+            .try_collect::<Vec<Arc<BDDDomain>>>()?,
+        )
+        .clone();
+      self.instructions.push(BIRInst::Copy { to: var2.clone(), from: var.clone() });
     }
     Ok(())
   }
@@ -918,7 +1058,7 @@ pub fn union_of<T: Clone + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {
 }
 pub trait BIRVisitor<E> {
   fn iter(&mut self, current: &Variable, next: &Variable, body: &Vec<BIRInst>) -> Result<(), E>;
-  fn empty(&mut self, to: &Variable) -> Result<(), E>;
+  fn phi(&mut self, to: &Variable, left: &Variable, right: &Variable) -> Result<(), E>;
   fn load(&mut self, to: &Variable, from: &Location) -> Result<(), E>;
   fn store(&mut self, from: &Variable, to: &Location) -> Result<(), E>;
   fn copy(&mut self, to: &Variable, from: &Variable) -> Result<(), E>;

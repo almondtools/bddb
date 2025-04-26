@@ -3,6 +3,44 @@ use std::iter::FromIterator;
 use std::ops::Deref;
 use std::vec::IntoIter;
 
+pub enum ExactlyOnce<T> {
+  None,
+  One(T),
+  Many,
+}
+impl<T> ExactlyOnce<T> {
+  pub fn accept(self, item: T) -> Self {
+    match self {
+      ExactlyOnce::None => ExactlyOnce::One(item),
+      _ => ExactlyOnce::Many,
+    }
+  }
+
+  pub fn expect(self, msg: &str) -> T {
+    match self {
+      ExactlyOnce::One(item) => item,
+      _ => None.expect(msg),
+    }
+  }
+
+  pub fn is_many(&self) -> bool {
+    if let ExactlyOnce::Many = self { true } else { false }
+  }
+}
+
+impl<T> FromIterator<T> for ExactlyOnce<T> {
+  fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+    let mut once: ExactlyOnce<T> = ExactlyOnce::None;
+    for item in iter.into_iter() {
+      once = once.accept(item);
+      if once.is_many() {
+        return once;
+      }
+    }
+    once
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct VecSet<T: PartialEq> {
   items: Vec<T>,
